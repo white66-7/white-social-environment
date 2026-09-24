@@ -1,0 +1,14 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 头部 -->
+    <path
+        android:fillColor="#71717A"
+        android:pathData="M12,12 c2.21,0 4,-1.79 4,-4 s-1.79,-4 -4,-4 s-4,1.79 -4,4 s1.79,4 4,4 Z" />
+    <!-- 肩部轮廓 -->
+    <path
+        android:fillColor="#71717A"
+        android:pathData="M12,14.5 c-3.31,0 -8,1.66 -8,4.5 L4,21 L20,21 L20,19 C20,16.16 15.31,14.5 12,14.5 Z" />
+</vector>

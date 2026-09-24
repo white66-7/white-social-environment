@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<set xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:anim/accelerate_decelerate_interpolator">
+
+    <!-- 柔和呼吸缩放 (4秒周期反转) -->
+    <scale
+        android:duration="4500"
+        android:fromXScale="0.85"
+        android:fromYScale="0.85"
+        android:pivotX="50%"
+        android:pivotY="50%"
+        android:repeatCount="infinite"
+        android:repeatMode="reverse"
+        android:toXScale="1.2"
+        android:toYScale="1.2" />
+
+    <!-- 呼吸透明度淡入淡出 -->
+    <alpha
+        android:duration="4500"
+        android:fromAlpha="0.35"
+        android:repeatCount="infinite"
+        android:repeatMode="reverse"
+        android:toAlpha="0.85" />
+
+    <!-- 缓慢轻微漂移 -->
+    <translate
+        android:duration="6000"
+        android:fromXDelta="-25dp"
+        android:fromYDelta="-20dp"
+        android:repeatCount="infinite"
+        android:repeatMode="reverse"
+        android:toXDelta="25dp"
+        android:toYDelta="20dp" />
+</set>

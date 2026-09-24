@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">无名小群</string>
+
+    <!-- 房间状态显示 -->
+    <string name="room_idle_title">空闲</string>
+    <string name="room_idle_subtitle">无人开启房间</string>
+    <string name="room_hosting_me_title">你正在放歌</string>
+    <string name="room_hosting_other_title">%1$s 正在放歌</string>
+    <string name="room_id_format">房间号: %1$s</string>
+    <string name="room_unknown_id">未知</string>
+    <string name="room_default_inviter">群友</string>
+</resources>
