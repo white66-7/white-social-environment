@@ -112,7 +112,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var ivHostAvatar: ShapeableImageView
     private lateinit var tvHostMessage: TextView
     private lateinit var btnJoin: MaterialButton
-    private lateinit var btnStopHosting: MaterialButton
     private lateinit var layoutHostSection: View
     private lateinit var btnPasteInvite: TextView
     private lateinit var etInviteCode: EditText
@@ -121,6 +120,7 @@ class MainActivity : AppCompatActivity() {
     // 成员主界面控件
     private lateinit var tvMemberCountBadge: TextView
     private lateinit var layoutMembersContainer: LinearLayout
+    private var webMembersLoader: WebView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -128,19 +128,22 @@ class MainActivity : AppCompatActivity() {
 
         sessionManager = SessionManager(this)
 
-        // 息屏/后台被系统回收后重新进入：先把「我正在放歌」的身份认领回来，
-        // 否则会被当成普通听众，房间明明还在（音乐还在放）也会显示空闲。
-        restoreHostingStateIfAny()
-
         initViews()
         initWebViewSettings()
         setupListeners()
+
+        // 核心改动：视图初始化后的第 1 毫秒立刻锁定加载态，把默认 XML 中的“空闲”与口令区彻底隐藏
+        showLoadingState()
+
+        // 息屏/后台被系统回收后重新进入：先把「我正在放歌」的身份认领回来
+        restoreHostingStateIfAny()
     }
 
     override fun onResume() {
         super.onResume()
         updateUserUi()
 
+        // 进入或唤醒页面时，立刻展示纯净加载屏并探测最新状态
         showLoadingState()
         checkAndProbeRoomOnEntry()
 
@@ -166,6 +169,14 @@ class MainActivity : AppCompatActivity() {
         webHexLoader.loadDataWithBaseURL(null, "", "text/html", "utf-8", null)
         webHexLoader.clearHistory()
         webHexLoader.destroy()
+
+        webMembersLoader?.let {
+            (it.parent as? ViewGroup)?.removeView(it)
+            it.loadDataWithBaseURL(null, "", "text/html", "utf-8", null)
+            it.clearHistory()
+            it.destroy()
+            webMembersLoader = null
+        }
     }
 
     // =========================================================================
@@ -268,7 +279,6 @@ class MainActivity : AppCompatActivity() {
         ivHostAvatar = findViewById(R.id.ivHostAvatar)
         tvHostMessage = findViewById(R.id.tvHostMessage)
         btnJoin = findViewById(R.id.btnJoin)
-        btnStopHosting = findViewById(R.id.btnStopHosting)
         layoutHostSection = findViewById(R.id.layoutHostSection)
         btnPasteInvite = findViewById(R.id.btnPasteInvite)
         etInviteCode = findViewById(R.id.etInviteCode)
@@ -287,6 +297,22 @@ class MainActivity : AppCompatActivity() {
         webHexLoader.isHorizontalScrollBarEnabled = false
     }
 
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun getOrCreateMembersLoader(): WebView {
+        val existing = webMembersLoader
+        if (existing != null) return existing
+
+        val webView = WebView(this).apply {
+            setBackgroundColor(0)
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            isVerticalScrollBarEnabled = false
+            isHorizontalScrollBarEnabled = false
+        }
+        webMembersLoader = webView
+        return webView
+    }
+
     private fun switchAnimation(animType: Int) {
         if (currentAnimType == animType) return
         currentAnimType = animType
@@ -299,16 +325,35 @@ class MainActivity : AppCompatActivity() {
         webHexLoader.loadDataWithBaseURL(null, htmlContent, "text/html", "UTF-8", null)
     }
 
+    // 纯净加载态
     private fun showLoadingState() {
         switchAnimation(ANIM_SPINNER)
-        // 隐藏加载状态下的下方文字提示
+
+        // 下方文字删掉
         tvHostMessage.visibility = View.GONE
         tvHostMessage.text = ""
 
         ivHostAvatar.visibility = View.GONE
         btnJoin.visibility = View.GONE
-        btnStopHosting.visibility = View.GONE
         layoutHostSection.visibility = View.GONE
+    }
+
+    private fun showMembersLoading() {
+        tvMemberCountBadge.visibility = View.GONE
+        layoutMembersContainer.removeAllViews()
+
+        val loader = getOrCreateMembersLoader()
+        (loader.parent as? ViewGroup)?.removeView(loader)
+        loader.loadDataWithBaseURL(null, getDotSpinnerHtml(), "text/html", "UTF-8", null)
+
+        val params = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp2px(260)
+        ).apply {
+            gravity = Gravity.CENTER
+            topMargin = dp2px(40)
+        }
+        layoutMembersContainer.addView(loader, params)
     }
 
     private fun updateUserUi() {
@@ -376,14 +421,10 @@ class MainActivity : AppCompatActivity() {
         btnJoin.setOnClickListener {
             val link = currentDeepLink
             if (link.isNullOrEmpty()) {
-                showTip("当前无可用房间链接")
+                showTip("当前无可用链接")
                 return@setOnClickListener
             }
             verifyAndJoinRoom(link)
-        }
-
-        btnStopHosting.setOnClickListener {
-            stopHostingManually()
         }
 
         btnPublishRoom.setOnClickListener {
@@ -397,7 +438,7 @@ class MainActivity : AppCompatActivity() {
             val text = etInviteCode.text.toString().trim()
             val roomInfo = NeriDeepLinkHelper.parseInvitation(text)
             if (roomInfo == null || roomInfo.roomId.isNullOrEmpty()) {
-                showTip("未识别出合法的 NeriPlayer 邀请口令！")
+                showTip("非法 NeriPlayer 邀请口令")
                 return@setOnClickListener
             }
 
@@ -431,7 +472,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun verifyAndJoinRoom(link: String) {
         btnJoin.isEnabled = false
-        btnJoin.text = "核验中..."
+        btnJoin.text = "核验"
 
         lifecycleScope.launch(Dispatchers.IO) {
             val request = Request.Builder()
@@ -455,14 +496,14 @@ class MainActivity : AppCompatActivity() {
                         if (exists) {
                             val launched = NeriDeepLinkHelper.launchPlayer(this@MainActivity, link)
                             if (!launched) {
-                                showTip("未找到 NeriPlayer，请确认已安装！")
+                                showTip("未找到 NeriPlayer")
                             }
                         } else {
-                            showTip("房主已结束放歌或房间已解散")
+                            showTip("房主已结束放歌")
                             updateRoomUi(false, null, null, null, null)
                         }
                     } else {
-                        showTip("核验失败，请重试")
+                        showTip("核验失败")
                     }
                 }
             } catch (e: Exception) {
@@ -470,7 +511,7 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     btnJoin.isEnabled = true
                     btnJoin.text = "加入"
-                    showTip("网络异常，无法核验房间状态")
+                    showTip("网络异常")
                 }
             }
         }
@@ -480,13 +521,14 @@ class MainActivity : AppCompatActivity() {
     // 核心业务：拉取并渲染全体密钥注册成员
     // =========================================================================
     private fun fetchRegisteredMembers() {
+        showMembersLoading()
+
         lifecycleScope.launch(Dispatchers.IO) {
             val token = sessionManager.getToken()
             val requestBuilder = Request.Builder()
                 .url("$BASE_URL/user/list")
                 .get()
 
-            // 1. 如果有登录 Token，带上鉴权头
             if (!token.isNullOrEmpty()) {
                 requestBuilder.addHeader("Authorization", "Bearer $token")
             }
@@ -499,8 +541,6 @@ class MainActivity : AppCompatActivity() {
 
                 if (response.isSuccessful && body.isNotEmpty()) {
                     val trimmed = body.trim()
-
-                    // 2. 智能兼容：无论后端返回的是直接数组 [...] 还是对象 {"data": [...]} / {"users": [...]}
                     val dataArray = if (trimmed.startsWith("[")) {
                         org.json.JSONArray(trimmed)
                     } else {
@@ -530,7 +570,6 @@ class MainActivity : AppCompatActivity() {
                     Log.w(TAG, "成员列表请求未成功: code=${response.code}, body=$body")
                 }
 
-                // 3. 核心兜底：如果你已登录，但接口里还没你（或接口出错），自动把自己加在第 1 位
                 if (sessionManager.isLoggedIn()) {
                     val myName = sessionManager.getUsername()
                     val hasMe = memberList.any { it.username.equals(myName, ignoreCase = true) }
@@ -553,7 +592,6 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 Log.e(TAG, "拉取成员列表异常", e)
                 withContext(Dispatchers.Main) {
-                    // 网络异常时，只要自己登录了，本地也保底显示自己
                     if (sessionManager.isLoggedIn()) {
                         renderMembersList(
                             listOf(
@@ -571,8 +609,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+
     @SuppressLint("SetTextI18n")
     private fun renderMembersList(members: List<RegisteredMember>) {
+        tvMemberCountBadge.visibility = View.VISIBLE
         tvMemberCountBadge.text = "${members.size} 位已认证"
         layoutMembersContainer.removeAllViews()
 
@@ -640,7 +680,6 @@ class MainActivity : AppCompatActivity() {
         return try {
             val json = JSONObject(raw)
 
-            // 换了账号，旧房间的凭据作废
             val owner = json.optString("owner", "")
             if (owner.isNotEmpty() && owner != sessionManager.getUsername()) {
                 sessionManager.clearHostingRoom()
@@ -716,14 +755,13 @@ class MainActivity : AppCompatActivity() {
                             }
                             updateRoomUi(true, inviter, publisher, hostAvatarUrl, deepLink)
                         } else {
-                            // 服务端已经没有这个房间了（多半是息屏期间心跳被系统掐断、租约到期）。
-                            // 只要本地还留着房主凭据就直接重新开播，而不是干等着显示空闲。
                             val info = currentRoomInfo ?: restoreHostingRoom()
                             if (info != null) {
                                 Log.w(TAG, "服务端房间已失效，自动重新开播 roomId=${info.roomId}")
                                 currentRoomInfo = info
                                 isHosting = true
                                 startHeartbeat()
+                                // 保持纯净加载屏，后台重开播，直到开播成功再展示放歌 UI
                                 postRoomState(info, action = "start", isResume = true)
                             } else {
                                 isHosting = false
@@ -736,10 +774,18 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     Log.w(TAG, "进入房间探测未成功: code=${response.code}")
                     withContext(Dispatchers.Main) {
-                        // 非 2xx 只代表「这次没问到」，不代表房间没了。
-                        // 房主端尤其不能因为一次查询失败就停掉心跳 —— 那会让房间真的消失。
                         if (!isHosting) {
                             updateRoomUi(false, null, null, null, null)
+                        } else {
+                            // 房主端：若探测请求未成功，兜底恢复放歌 UI，避免死锁在加载态
+                            val myUsername = sessionManager.getUsername()
+                            updateRoomUi(
+                                exists = true,
+                                inviter = currentRoomInfo?.inviter ?: myUsername,
+                                publisher = myUsername,
+                                hostAvatarUrl = sessionManager.getAvatarUri(),
+                                deepLink = currentRoomInfo?.rawUri
+                            )
                         }
                         startPollingRoomStatus()
                     }
@@ -747,9 +793,17 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 Log.w(TAG, "探测异常: ${e.message}")
                 withContext(Dispatchers.Main) {
-                    // 网络异常同理，绝不拿它去停房主的心跳
                     if (!isHosting) {
                         updateRoomUi(false, null, null, null, null)
+                    } else {
+                        val myUsername = sessionManager.getUsername()
+                        updateRoomUi(
+                            exists = true,
+                            inviter = currentRoomInfo?.inviter ?: myUsername,
+                            publisher = myUsername,
+                            hostAvatarUrl = sessionManager.getAvatarUri(),
+                            deepLink = currentRoomInfo?.rawUri
+                        )
                     }
                     startPollingRoomStatus()
                 }
@@ -769,7 +823,7 @@ class MainActivity : AppCompatActivity() {
 
         switchAnimation(ANIM_HEX)
 
-        // 恢复文字展示
+        // 探测完成，恢复文字展示
         tvHostMessage.visibility = View.VISIBLE
 
         if (!exists) {
@@ -781,7 +835,6 @@ class MainActivity : AppCompatActivity() {
             tvHostMessage.text = "空闲"
             ivHostAvatar.visibility = View.GONE
             btnJoin.visibility = View.GONE
-            btnStopHosting.visibility = View.GONE
             layoutHostSection.visibility = View.VISIBLE
         } else {
             currentDeepLink = deepLink
@@ -804,8 +857,6 @@ class MainActivity : AppCompatActivity() {
             }
 
             btnJoin.visibility = if (isMe) View.GONE else View.VISIBLE
-            btnStopHosting.visibility = if (isMe) View.VISIBLE else View.GONE
-
             layoutHostSection.visibility = View.GONE
         }
     }
@@ -868,20 +919,12 @@ class MainActivity : AppCompatActivity() {
                 if (code == 404) {
                     runOnUiThread { handleRoomLostWhileHosting() }
                 } else if (code in 200..299) {
-                    // 心跳正常，清空重试计数
                     runOnUiThread { hostRetryCount = 0 }
                 }
             }
         })
     }
 
-    /**
-     * 房主心跳收到 404 时的处理。
-     *
-     * 以前这里直接判定「房间已解散」并停掉心跳，于是一次网络抖动、一次 Redis 租约过期
-     * 就会让房主的房间永久消失。现在改成先尝试自动重新开播（最多 MAX_HOST_RETRY 次），
-     * 让房间能自愈，只有确实重开不起来了才真正收摊。
-     */
     private fun handleRoomLostWhileHosting() {
         if (!isHosting || isPublishing) return
 
@@ -889,16 +932,15 @@ class MainActivity : AppCompatActivity() {
         if (info == null || hostRetryCount >= MAX_HOST_RETRY) {
             isHosting = false
             stopHeartbeat()
-            // 真的救不回来了，作废凭据，免得后面反复复活
             sessionManager.clearHostingRoom()
             updateRoomUi(false, null, null, null, null)
-            showTip("检测到房间已解散，放歌结束")
+            showTip("房间已解散")
             return
         }
 
         hostRetryCount++
-        Log.w(TAG, "房间连接中断，自动重新开播（第 $hostRetryCount 次）")
-        showTip("房间连接中断，正在自动重连…")
+        Log.w(TAG, "连接中断第 $hostRetryCount 次")
+        showTip("房正在重连")
         currentRoomInfo = info
         postRoomState(info, action = "start", isResume = true)
     }
@@ -907,7 +949,6 @@ class MainActivity : AppCompatActivity() {
         if (pollingJob?.isActive == true) return
         pollingJob = lifecycleScope.launch(Dispatchers.IO) {
             while (isActive) {
-                // 后端已经是纯读接口（不会再拿探活打断播放），这里放慢节奏省电省流量
                 val pollInterval = if (currentDeepLink != null) 5000L else 10000L
                 delay(pollInterval)
                 fetchRoomStatusSequential()
@@ -943,8 +984,6 @@ class MainActivity : AppCompatActivity() {
                         currentRoomInfo = NeriDeepLinkHelper.parseInvitation(deepLink)
                         updateRoomUi(true, inviter, publisher, hostAvatarUrl, deepLink)
                     } else {
-                        // 防抖：单次查不到不算数，连续 ROOM_MISS_THRESHOLD 次才真的切「空闲」，
-                        // 否则一次网络抖动就会让 UI 闪一下空闲，房主端还会因此停掉心跳。
                         roomMissCount++
                         if (roomMissCount >= ROOM_MISS_THRESHOLD) {
                             currentRoomInfo = null
@@ -957,32 +996,13 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             } else {
-                // 5xx / 非 2xx 只代表「这次没问到」，不代表「房间没了」，一律不动 UI、不计入防抖
-                Log.w(TAG, "房间状态查询未成功: code=${response.code}")
+                Log.w(TAG, "查询未成功: code=${response.code}")
             }
         } catch (e: Exception) {
             Log.w(TAG, "轮询网络波动: ${e.message}")
         }
     }
 
-    private fun stopHostingManually() {
-        isHosting = false
-        stopHeartbeat()
-        // 主动结束放歌：作废凭据，之后进 App 不会再自动把房间复活
-        sessionManager.clearHostingRoom()
-        notifyServerRoomDead()
-        updateRoomUi(false, null, null, null, null)
-        showTip("已主动结束放歌")
-    }
-
-    private fun notifyServerRoomDead() {
-        postRoomState(null, action = "stop")
-    }
-
-    /**
-     * @param isResume 息屏/被回收后回来自动重播。后端据此走只读存在性检查，
-     *                 不再 join 一次房间（否则每次回前台都会把正在听歌的人暂停一下）。
-     */
     private fun postRoomState(info: RoomInfo?, action: String, isResume: Boolean = false) {
         val effectiveInviter = if (!info?.inviter.isNullOrBlank()) info.inviter else sessionManager.getUsername()
 
@@ -1016,7 +1036,7 @@ class MainActivity : AppCompatActivity() {
                         btnPublishRoom.text = "开启"
                         btnPasteInvite.isEnabled = true
                         etInviteCode.isEnabled = true
-                        showTip("网络连接超时，开启失败")
+                        showTip("网络连接超时")
                     }
                 }
             }
@@ -1040,14 +1060,10 @@ class MainActivity : AppCompatActivity() {
                                 errMsg = errJson.optString("message", errMsg)
                             } catch (_: Exception) {}
 
-                            // 400 / 409 是服务端的终局判决（房间不存在 / 已被别人接管），凭据作废；
-                            // 5xx 只是这一趟没成功，保留凭据等下次心跳或下次进 App 再试。
                             if (response.code == 400 || response.code == 409) {
                                 sessionManager.clearHostingRoom()
                                 isHosting = false
                                 stopHeartbeat()
-                                // 只有自动恢复流程需要把界面从加载动画收回来；
-                                // 首次开播失败时界面还停在原来的房间列表上，别去动它
                                 if (isResume) {
                                     updateRoomUi(false, null, null, null, null)
                                 }
@@ -1060,7 +1076,6 @@ class MainActivity : AppCompatActivity() {
                             roomMissCount = 0
                             hostRetryCount = 0
 
-                            // 落盘房主凭据，息屏/被系统回收后靠它认领房间
                             info?.let { persistHostingRoom(it) }
 
                             val myUsername = sessionManager.getUsername()
@@ -1073,7 +1088,11 @@ class MainActivity : AppCompatActivity() {
                             )
 
                             startHeartbeat()
-                            showTip("房间上线成功！")
+
+                            // 手动开启时提示上线成功
+                            if (!isResume) {
+                                showTip("成功")
+                            }
                         }
                     }
                 }
@@ -1404,9 +1423,6 @@ class SessionManager(context: Context) {
     }
 
     // ===== 房主身份持久化 =====
-    // 息屏后 App 可能被系统回收，内存里的 isHosting / currentRoomInfo 会全部丢失，
-    // 再打开时就认不出自己是房主，只能显示「空闲」。所以把开播凭据落盘。
-
     fun saveHostingRoom(json: String) {
         prefs.edit { putString(KEY_HOSTING_ROOM, json) }
     }
