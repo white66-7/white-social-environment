@@ -5,13 +5,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.text.InputFilter
-import android.text.TextUtils
-import android.view.Gravity
-import android.view.View
-import android.view.ViewGroup
-import android.view.animation.DecelerateInterpolator
 import android.widget.EditText
-import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -19,6 +13,8 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import coil.load
 import coil.transform.CircleCropTransformation
+import com.example.social_music.utils.CapsuleTipManager
+import com.example.social_music.utils.SessionManager
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.imageview.ShapeableImageView
 import okhttp3.Call
@@ -34,19 +30,18 @@ import java.io.IOException
 class SettingsActivity : AppCompatActivity() {
 
     private lateinit var sessionManager: SessionManager
+    private lateinit var tipManager: CapsuleTipManager
+
     private lateinit var tvUsername: TextView
     private lateinit var ivAvatar: ShapeableImageView
     private val client = OkHttpClient()
-
-    // 顶部灵动药丸胶囊引用（与 MainActivity 一致）
-    private var capsuleTipView: View? = null
-    private var capsuleHideRunnable: Runnable? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
 
         sessionManager = SessionManager(this)
+        tipManager = CapsuleTipManager(this)
 
         val btnBack = findViewById<ImageView>(R.id.btnBack)
         val itemAvatar = findViewById<LinearLayout>(R.id.itemAvatar)
@@ -85,95 +80,9 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        val decorView = window.decorView as? ViewGroup
-        capsuleHideRunnable?.let { decorView?.removeCallbacks(it) }
-    }
-
-    // =========================================================================
-    // 极速灵动药丸胶囊提示（完全同步 MainActivity 样式）
-    // =========================================================================
-    private fun showTip(message: String) {
-        val decorView = window.decorView as? ViewGroup ?: return
-        capsuleHideRunnable?.let { decorView.removeCallbacks(it) }
-
-        if (capsuleTipView == null) {
-            val pill = FrameLayout(this).apply {
-                elevation = 18f
-                setPadding(dp2px(16), dp2px(8), dp2px(16), dp2px(8))
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.RECTANGLE
-                    cornerRadius = dp2px(99).toFloat()
-                    setColor(0xEE0F172A.toInt()) // 深石板蓝半透背景
-                    setStroke(dp2px(1), 0x3394A3B8.toInt())
-                }
-            }
-
-            val tv = TextView(this).apply {
-                textSize = 13f
-                setTextColor(0xFFF8FAFC.toInt())
-                typeface = Typeface.DEFAULT_BOLD
-                gravity = Gravity.CENTER
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END
-            }
-
-            pill.addView(tv)
-
-            val statusBarHeight = getStatusBarHeight()
-            val layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-                topMargin = statusBarHeight + dp2px(12)
-            }
-
-            decorView.addView(pill, layoutParams)
-            capsuleTipView = pill
-        }
-
-        val pill = capsuleTipView as? FrameLayout ?: return
-        val textView = pill.getChildAt(0) as? TextView ?: return
-
-        textView.text = message
-        pill.visibility = View.VISIBLE
-
-        pill.scaleX = 0.85f
-        pill.scaleY = 0.85f
-        pill.alpha = 0f
-        pill.animate()
-            .scaleX(1.0f)
-            .scaleY(1.0f)
-            .alpha(1.0f)
-            .setDuration(120)
-            .setInterpolator(DecelerateInterpolator())
-            .start()
-
-        val hideTask = Runnable {
-            pill.animate()
-                .scaleX(0.85f)
-                .scaleY(0.85f)
-                .alpha(0f)
-                .setDuration(120)
-                .withEndAction { pill.visibility = View.GONE }
-                .start()
-        }
-        capsuleHideRunnable = hideTask
-        decorView.postDelayed(hideTask, 1500)
-    }
+    private fun showTip(message: String) = tipManager.showTip(message)
 
     private fun dp2px(dp: Int): Int = (dp * resources.displayMetrics.density + 0.5f).toInt()
-
-    private fun getStatusBarHeight(): Int {
-        var result = dp2px(24)
-        val resourceId = resources.getIdentifier("status_bar_height", "dimen", "android")
-        if (resourceId > 0) {
-            result = resources.getDimensionPixelSize(resourceId)
-        }
-        return result
-    }
 
     // =========================================================================
     // MainActivity 风格的高质感无边框圆角输入弹窗

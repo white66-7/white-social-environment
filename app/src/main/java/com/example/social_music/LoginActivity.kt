@@ -1,21 +1,14 @@
 package com.example.social_music
 
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.text.Editable
-import android.text.TextUtils
 import android.text.TextWatcher
-import android.view.Gravity
 import android.view.KeyEvent
-import android.view.View
-import android.view.ViewGroup
-import android.view.animation.DecelerateInterpolator
 import android.widget.EditText
-import android.widget.FrameLayout
 import android.widget.ImageView
-import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.example.social_music.utils.CapsuleTipManager
+import com.example.social_music.utils.SessionManager
 import com.google.android.material.button.MaterialButton
 import okhttp3.Call
 import okhttp3.Callback
@@ -31,6 +24,7 @@ import java.util.concurrent.TimeUnit
 class LoginActivity : AppCompatActivity() {
 
     private lateinit var sessionManager: SessionManager
+    private lateinit var tipManager: CapsuleTipManager
 
     // 15 秒长稳态客户端，抵御冷启动
     private val client = OkHttpClient.Builder()
@@ -46,106 +40,18 @@ class LoginActivity : AppCompatActivity() {
     private lateinit var pin4: EditText
     private lateinit var btnLogin: MaterialButton
 
-    // 顶部灵动药丸胶囊引用（与 MainActivity / SettingsActivity 完全一致）
-    private var capsuleTipView: View? = null
-    private var capsuleHideRunnable: Runnable? = null
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_login)
 
         sessionManager = SessionManager(this)
+        tipManager = CapsuleTipManager(this)
 
         initViews()
         setupPinJumpLogic()
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        val decorView = window.decorView as? ViewGroup
-        capsuleHideRunnable?.let { decorView?.removeCallbacks(it) }
-    }
-
-    private fun showTip(message: String) {
-        val decorView = window.decorView as? ViewGroup ?: return
-        capsuleHideRunnable?.let { decorView.removeCallbacks(it) }
-
-        if (capsuleTipView == null) {
-            val pill = FrameLayout(this).apply {
-                elevation = 18f
-                setPadding(dp2px(16), dp2px(8), dp2px(16), dp2px(8))
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.RECTANGLE
-                    cornerRadius = dp2px(99).toFloat()
-                    setColor(0xEE0F172A.toInt()) // 深石板蓝半透明底色
-                    setStroke(dp2px(1), 0x3394A3B8.toInt())
-                }
-            }
-
-            val tv = TextView(this).apply {
-                textSize = 13f
-                setTextColor(0xFFF8FAFC.toInt())
-                typeface = Typeface.DEFAULT_BOLD
-                gravity = Gravity.CENTER
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END
-            }
-
-            pill.addView(tv)
-
-            val statusBarHeight = getStatusBarHeight()
-            val layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-                topMargin = statusBarHeight + dp2px(12)
-            }
-
-            decorView.addView(pill, layoutParams)
-            capsuleTipView = pill
-        }
-
-        val pill = capsuleTipView as? FrameLayout ?: return
-        val textView = pill.getChildAt(0) as? TextView ?: return
-
-        textView.text = message
-        pill.visibility = View.VISIBLE
-
-        pill.scaleX = 0.85f
-        pill.scaleY = 0.85f
-        pill.alpha = 0f
-        pill.animate()
-            .scaleX(1.0f)
-            .scaleY(1.0f)
-            .alpha(1.0f)
-            .setDuration(120)
-            .setInterpolator(DecelerateInterpolator())
-            .start()
-
-        val hideTask = Runnable {
-            pill.animate()
-                .scaleX(0.85f)
-                .scaleY(0.85f)
-                .alpha(0f)
-                .setDuration(120)
-                .withEndAction { pill.visibility = View.GONE }
-                .start()
-        }
-        capsuleHideRunnable = hideTask
-        decorView.postDelayed(hideTask, 1500)
-    }
-
-    private fun dp2px(dp: Int): Int = (dp * resources.displayMetrics.density + 0.5f).toInt()
-
-    private fun getStatusBarHeight(): Int {
-        var result = dp2px(24)
-        val resourceId = resources.getIdentifier("status_bar_height", "dimen", "android")
-        if (resourceId > 0) {
-            result = resources.getDimensionPixelSize(resourceId)
-        }
-        return result
-    }
+    private fun showTip(message: String) = tipManager.showTip(message)
 
     private fun initViews() {
         val btnClose = findViewById<ImageView>(R.id.btnClose)

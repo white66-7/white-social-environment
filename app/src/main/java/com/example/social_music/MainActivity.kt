@@ -1,31 +1,29 @@
 package com.example.social_music
 
 import android.annotation.SuppressLint
-import android.content.ActivityNotFoundException
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.content.SharedPreferences
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
-import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.view.animation.DecelerateInterpolator
 import android.webkit.WebView
 import android.widget.EditText
-import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.edit
-import androidx.core.net.toUri
 import androidx.lifecycle.lifecycleScope
 import coil.load
 import coil.transform.CircleCropTransformation
+import com.example.social_music.model.RegisteredMember
+import com.example.social_music.model.RoomInfo
+import com.example.social_music.utils.AnimationTemplates
+import com.example.social_music.utils.CapsuleTipManager
+import com.example.social_music.utils.NeriDeepLinkHelper
+import com.example.social_music.utils.SessionManager
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.imageview.ShapeableImageView
 import kotlinx.coroutines.Dispatchers
@@ -44,7 +42,6 @@ import okhttp3.Response
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
-import java.util.regex.Pattern
 import kotlin.time.Duration.Companion.seconds
 
 class MainActivity : AppCompatActivity() {
@@ -54,14 +51,7 @@ class MainActivity : AppCompatActivity() {
         private const val BASE_URL = "https://www.white667.xyz/api"
         private const val DEFAULT_NERI_SERVER = "https://neriplayer.hancat.work"
 
-        private const val ANIM_NONE = 0
-        private const val ANIM_SPINNER = 1
-        private const val ANIM_HEX = 2
-
-        // 「房间消失」防抖：连续这么多次查不到才切「空闲」，避免一次网络抖动把 UI 打成空闲
         private const val ROOM_MISS_THRESHOLD = 3
-
-        // 房主心跳收到 404 后自动重开播的最大次数
         private const val MAX_HOST_RETRY = 3
     }
 
@@ -71,28 +61,29 @@ class MainActivity : AppCompatActivity() {
         .build()
 
     private lateinit var sessionManager: SessionManager
+    private lateinit var tipManager: CapsuleTipManager
+
     private var currentDeepLink: String? = null
     private var currentRoomInfo: RoomInfo? = null
     private var isHosting = false
-    private var currentAnimType = ANIM_NONE
+    private var currentAnimType = AnimationTemplates.ANIM_NONE
 
-    // 并发防跳动锁
     private var isPublishing = false
-
-    // 连续查不到房间的次数（防抖用，只有连续 ROOM_MISS_THRESHOLD 次才真的切「空闲」）
     private var roomMissCount = 0
-
-    // 房主心跳 404 后的自动重开播次数
     private var hostRetryCount = 0
 
-    // 协程任务引用
     private var initProbeJob: Job? = null
     private var pollingJob: Job? = null
     private var heartbeatJob: Job? = null
 
-    // 悬浮胶囊 Tip 引用
-    private var capsuleTipView: View? = null
-    private var capsuleHideRunnable: Runnable? = null
+    // ⏱ 播放进度平滑推算锚点
+    private lateinit var pbPlayerProgress: ProgressBar
+    private var basePositionMs: Long = 0L
+    private var baseTimestampMs: Long = 0L
+    private var durationMs: Long = 0L
+    private var playbackRate: Double = 1.0
+    private var isPlaying: Boolean = false
+    private var progressTickerJob: Job? = null
 
     // 全局顶部控件
     private lateinit var ivUserAvatar: ShapeableImageView
@@ -111,6 +102,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webHexLoader: WebView
     private lateinit var ivHostAvatar: ShapeableImageView
     private lateinit var tvHostMessage: TextView
+
+    // 🎵 播放器卡片控件
+    private lateinit var layoutAudioPlayerCard: View
+    private lateinit var ivPlayerAlbumCover: ShapeableImageView
+    private lateinit var tvPlayerSongTitle: TextView
+    private lateinit var tvPlayerArtist: TextView
+
     private lateinit var btnJoin: MaterialButton
     private lateinit var layoutHostSection: View
     private lateinit var btnPasteInvite: TextView
@@ -127,23 +125,19 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         sessionManager = SessionManager(this)
+        tipManager = CapsuleTipManager(this)
 
         initViews()
         initWebViewSettings()
         setupListeners()
 
-        // 核心改动：视图初始化后的第 1 毫秒立刻锁定加载态，把默认 XML 中的“空闲”与口令区彻底隐藏
         showLoadingState()
-
-        // 息屏/后台被系统回收后重新进入：先把「我正在放歌」的身份认领回来
         restoreHostingStateIfAny()
     }
 
     override fun onResume() {
         super.onResume()
         updateUserUi()
-
-        // 进入或唤醒页面时，立刻展示纯净加载屏并探测最新状态
         showLoadingState()
         checkAndProbeRoomOnEntry()
 
@@ -154,6 +148,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
+        stopProgressTicker()
         initProbeJob?.cancel()
         pollingJob?.cancel()
         pollingJob = null
@@ -162,6 +157,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         stopHeartbeat()
+        stopProgressTicker()
         initProbeJob?.cancel()
         pollingJob?.cancel()
 
@@ -179,89 +175,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // =========================================================================
-    // 极速顶部灵动药丸胶囊提示（0延迟、零排队）
-    // =========================================================================
-    private fun showTip(message: String) {
-        val decorView = window.decorView as? ViewGroup ?: return
-        capsuleHideRunnable?.let { decorView.removeCallbacks(it) }
-
-        if (capsuleTipView == null) {
-            val pill = FrameLayout(this).apply {
-                elevation = 18f
-                setPadding(dp2px(16), dp2px(8), dp2px(16), dp2px(8))
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.RECTANGLE
-                    cornerRadius = dp2px(99).toFloat()
-                    setColor(0xEE0F172A.toInt())
-                    setStroke(dp2px(1), 0x3394A3B8.toInt())
-                }
-            }
-
-            val tv = TextView(this).apply {
-                textSize = 13f
-                setTextColor(0xFFF8FAFC.toInt())
-                typeface = Typeface.DEFAULT_BOLD
-                gravity = Gravity.CENTER
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END
-            }
-
-            pill.addView(tv)
-
-            val statusBarHeight = getStatusBarHeight()
-            val layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-                topMargin = statusBarHeight + dp2px(12)
-            }
-
-            decorView.addView(pill, layoutParams)
-            capsuleTipView = pill
-        }
-
-        val pill = capsuleTipView as? FrameLayout ?: return
-        val textView = pill.getChildAt(0) as? TextView ?: return
-
-        textView.text = message
-        pill.visibility = View.VISIBLE
-
-        pill.scaleX = 0.85f
-        pill.scaleY = 0.85f
-        pill.alpha = 0f
-        pill.animate()
-            .scaleX(1.0f)
-            .scaleY(1.0f)
-            .alpha(1.0f)
-            .setDuration(120)
-            .setInterpolator(DecelerateInterpolator())
-            .start()
-
-        val hideTask = Runnable {
-            pill.animate()
-                .scaleX(0.85f)
-                .scaleY(0.85f)
-                .alpha(0f)
-                .setDuration(120)
-                .withEndAction { pill.visibility = View.GONE }
-                .start()
-        }
-        capsuleHideRunnable = hideTask
-        decorView.postDelayed(hideTask, 1500)
-    }
+    private fun showTip(message: String) = tipManager.showTip(message)
 
     private fun dp2px(dp: Int): Int = (dp * resources.displayMetrics.density + 0.5f).toInt()
-
-    private fun getStatusBarHeight(): Int {
-        var result = dp2px(24)
-        val resourceId = resources.getIdentifier("status_bar_height", "dimen", "android")
-        if (resourceId > 0) {
-            result = resources.getDimensionPixelSize(resourceId)
-        }
-        return result
-    }
 
     private fun initViews() {
         ivUserAvatar = findViewById(R.id.ivUserAvatar)
@@ -278,6 +194,15 @@ class MainActivity : AppCompatActivity() {
         webHexLoader = findViewById(R.id.webHexLoader)
         ivHostAvatar = findViewById(R.id.ivHostAvatar)
         tvHostMessage = findViewById(R.id.tvHostMessage)
+
+        // 播放器卡片绑定
+        layoutAudioPlayerCard = findViewById(R.id.layoutAudioPlayerCard)
+        ivPlayerAlbumCover = findViewById(R.id.ivPlayerAlbumCover)
+        tvPlayerSongTitle = findViewById(R.id.tvPlayerSongTitle)
+        tvPlayerArtist = findViewById(R.id.tvPlayerArtist)
+        pbPlayerProgress = findViewById(R.id.pbPlayerProgress)
+        pbPlayerProgress.max = 1000 // 细分 1000 档位，平滑度极高
+
         btnJoin = findViewById(R.id.btnJoin)
         layoutHostSection = findViewById(R.id.layoutHostSection)
         btnPasteInvite = findViewById(R.id.btnPasteInvite)
@@ -318,21 +243,18 @@ class MainActivity : AppCompatActivity() {
         currentAnimType = animType
 
         val htmlContent = when (animType) {
-            ANIM_SPINNER -> getDotSpinnerHtml()
-            ANIM_HEX -> getHexLoaderHtml()
+            AnimationTemplates.ANIM_SPINNER -> AnimationTemplates.getDotSpinnerHtml()
+            AnimationTemplates.ANIM_HEX -> AnimationTemplates.getHexLoaderHtml()
             else -> ""
         }
         webHexLoader.loadDataWithBaseURL(null, htmlContent, "text/html", "UTF-8", null)
     }
 
-    // 纯净加载态
     private fun showLoadingState() {
-        switchAnimation(ANIM_SPINNER)
-
-        // 下方文字删掉
+        switchAnimation(AnimationTemplates.ANIM_SPINNER)
         tvHostMessage.visibility = View.GONE
         tvHostMessage.text = ""
-
+        layoutAudioPlayerCard.visibility = View.GONE
         ivHostAvatar.visibility = View.GONE
         btnJoin.visibility = View.GONE
         layoutHostSection.visibility = View.GONE
@@ -344,7 +266,7 @@ class MainActivity : AppCompatActivity() {
 
         val loader = getOrCreateMembersLoader()
         (loader.parent as? ViewGroup)?.removeView(loader)
-        loader.loadDataWithBaseURL(null, getDotSpinnerHtml(), "text/html", "UTF-8", null)
+        loader.loadDataWithBaseURL(null, AnimationTemplates.getDotSpinnerHtml(), "text/html", "UTF-8", null)
 
         val params = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
@@ -421,7 +343,7 @@ class MainActivity : AppCompatActivity() {
         btnJoin.setOnClickListener {
             val link = currentDeepLink
             if (link.isNullOrEmpty()) {
-                showTip("当前无可用链接")
+                showTip("当前无可用房间链接")
                 return@setOnClickListener
             }
             verifyAndJoinRoom(link)
@@ -438,7 +360,7 @@ class MainActivity : AppCompatActivity() {
             val text = etInviteCode.text.toString().trim()
             val roomInfo = NeriDeepLinkHelper.parseInvitation(text)
             if (roomInfo == null || roomInfo.roomId.isNullOrEmpty()) {
-                showTip("非法 NeriPlayer 邀请口令")
+                showTip("未识别出合法的 NeriPlayer 邀请口令！")
                 return@setOnClickListener
             }
 
@@ -472,7 +394,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun verifyAndJoinRoom(link: String) {
         btnJoin.isEnabled = false
-        btnJoin.text = "核验"
+        btnJoin.text = "核验中..."
 
         lifecycleScope.launch(Dispatchers.IO) {
             val request = Request.Builder()
@@ -496,14 +418,14 @@ class MainActivity : AppCompatActivity() {
                         if (exists) {
                             val launched = NeriDeepLinkHelper.launchPlayer(this@MainActivity, link)
                             if (!launched) {
-                                showTip("未找到 NeriPlayer")
+                                showTip("未找到 NeriPlayer，请确认已安装！")
                             }
                         } else {
-                            showTip("房主已结束放歌")
-                            updateRoomUi(false, null, null, null, null)
+                            showTip("房主已结束放歌或房间已解散")
+                            updateRoomUi(false, null, null, null, null, null, null)
                         }
                     } else {
-                        showTip("核验失败")
+                        showTip("核验失败，请重试")
                     }
                 }
             } catch (e: Exception) {
@@ -511,15 +433,12 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     btnJoin.isEnabled = true
                     btnJoin.text = "加入"
-                    showTip("网络异常")
+                    showTip("网络异常，无法核验房间状态")
                 }
             }
         }
     }
 
-    // =========================================================================
-    // 核心业务：拉取并渲染全体密钥注册成员
-    // =========================================================================
     private fun fetchRegisteredMembers() {
         showMembersLoading()
 
@@ -536,7 +455,6 @@ class MainActivity : AppCompatActivity() {
             try {
                 val response = client.newCall(requestBuilder.build()).execute()
                 val body = response.body?.string().orEmpty()
-
                 val memberList = mutableListOf<RegisteredMember>()
 
                 if (response.isSuccessful && body.isNotEmpty()) {
@@ -566,8 +484,6 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
                     }
-                } else {
-                    Log.w(TAG, "成员列表请求未成功: code=${response.code}, body=$body")
                 }
 
                 if (sessionManager.isLoggedIn()) {
@@ -588,7 +504,6 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     renderMembersList(memberList)
                 }
-
             } catch (e: Exception) {
                 Log.e(TAG, "拉取成员列表异常", e)
                 withContext(Dispatchers.Main) {
@@ -626,18 +541,8 @@ class MainActivity : AppCompatActivity() {
             val tvHostingBadge = itemView.findViewById<TextView>(R.id.tvHostingBadge)
 
             tvName.text = member.username
-
-            tvMeBadge.visibility = if (sessionManager.isLoggedIn() && member.username == myUsername) {
-                View.VISIBLE
-            } else {
-                View.GONE
-            }
-
-            tvHostingBadge.visibility = if (member.isHosting) {
-                View.VISIBLE
-            } else {
-                View.GONE
-            }
+            tvMeBadge.visibility = if (sessionManager.isLoggedIn() && member.username == myUsername) View.VISIBLE else View.GONE
+            tvHostingBadge.visibility = if (member.isHosting) View.VISIBLE else View.GONE
 
             if (member.avatarUrl.isNotEmpty()) {
                 ivAvatar.load(member.avatarUrl) {
@@ -654,15 +559,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    data class RegisteredMember(
-        val username: String,
-        val avatarUrl: String,
-        val isHosting: Boolean
-    )
-
-    // =========================================================================
-    // 房主身份持久化（息屏 / 被系统回收后还能认领自己的房间）
-    // =========================================================================
     private fun persistHostingRoom(info: RoomInfo) {
         val json = JSONObject().apply {
             put("owner", sessionManager.getUsername())
@@ -671,6 +567,8 @@ class MainActivity : AppCompatActivity() {
             put("deepLink", info.rawUri)
             put("serverUrl", info.serverUrl ?: DEFAULT_NERI_SERVER)
             put("inviter", info.inviter ?: "")
+            put("currentSong", info.currentSong ?: "")
+            put("currentCover", info.currentCover ?: "")
         }
         sessionManager.saveHostingRoom(json.toString())
     }
@@ -679,7 +577,6 @@ class MainActivity : AppCompatActivity() {
         val raw = sessionManager.getHostingRoom() ?: return null
         return try {
             val json = JSONObject(raw)
-
             val owner = json.optString("owner", "")
             if (owner.isNotEmpty() && owner != sessionManager.getUsername()) {
                 sessionManager.clearHostingRoom()
@@ -694,7 +591,9 @@ class MainActivity : AppCompatActivity() {
                 roomId = roomId,
                 inviter = json.optString("inviter", "").ifEmpty { null },
                 secret = json.optString("secret", "").ifEmpty { null },
-                serverUrl = json.optString("serverUrl", "").ifEmpty { null }
+                serverUrl = json.optString("serverUrl", "").ifEmpty { null },
+                currentSong = json.optString("currentSong", "").ifEmpty { null },
+                currentCover = json.optString("currentCover", "").ifEmpty { null }
             )
         } catch (e: Exception) {
             Log.w(TAG, "房主身份恢复失败", e)
@@ -711,23 +610,12 @@ class MainActivity : AppCompatActivity() {
         startHeartbeat()
     }
 
-    // =========================================================================
-    // 房间状态与轮询
-    // =========================================================================
     private fun checkAndProbeRoomOnEntry() {
         initProbeJob?.cancel()
         roomMissCount = 0
         initProbeJob = lifecycleScope.launch(Dispatchers.IO) {
-            val targetUrl = if (isHosting) {
-                "$BASE_URL/room/status?force=true"
-            } else {
-                "$BASE_URL/room/status"
-            }
-
-            val request = Request.Builder()
-                .url(targetUrl)
-                .get()
-                .build()
+            val targetUrl = if (isHosting) "$BASE_URL/room/status?force=true" else "$BASE_URL/room/status"
+            val request = Request.Builder().url(targetUrl).get().build()
 
             try {
                 val response = client.newCall(request).execute()
@@ -740,12 +628,21 @@ class MainActivity : AppCompatActivity() {
                     val publisher = json.optString("publisher", "")
                     val hostAvatarUrl = json.optString("hostAvatarUrl", "")
                     val deepLink = json.optString("deepLink", "")
+                    val currentSong = json.optString("currentSong", "").ifEmpty { null }
+                    val currentCover = json.optString("currentCover", "").ifEmpty { null }
+                    val durationMs = json.optLong("durationMs", 0L)
+                    val basePositionMs = json.optLong("basePositionMs", 0L)
+                    val baseTimestampMs = json.optLong("baseTimestampMs", System.currentTimeMillis())
+                    val playbackRate = json.optDouble("playbackRate", 1.0)
+                    val isPlaying = json.optBoolean("isPlaying", true)
 
                     withContext(Dispatchers.Main) {
                         if (exists && deepLink.isNotEmpty()) {
-                            val info = NeriDeepLinkHelper.parseInvitation(deepLink)
+                            val info = NeriDeepLinkHelper.parseInvitation(deepLink)?.copy(
+                                currentSong = currentSong,
+                                currentCover = currentCover
+                            )
                             currentRoomInfo = info
-
                             val myUsername = sessionManager.getUsername()
                             val isMe = sessionManager.isLoggedIn() && (myUsername == publisher || myUsername == inviter)
 
@@ -753,7 +650,20 @@ class MainActivity : AppCompatActivity() {
                                 isHosting = true
                                 startHeartbeat()
                             }
-                            updateRoomUi(true, inviter, publisher, hostAvatarUrl, deepLink)
+                            updateRoomUi(
+                                exists = true,
+                                inviter = inviter,
+                                publisher = publisher,
+                                hostAvatarUrl = hostAvatarUrl,
+                                deepLink = deepLink,
+                                currentSong = currentSong,
+                                currentCover = currentCover,
+                                durationMs = durationMs,
+                                basePositionMs = basePositionMs,
+                                baseTimestampMs = baseTimestampMs,
+                                playbackRate = playbackRate,
+                                isPlaying = isPlaying
+                            )
                         } else {
                             val info = currentRoomInfo ?: restoreHostingRoom()
                             if (info != null) {
@@ -761,30 +671,29 @@ class MainActivity : AppCompatActivity() {
                                 currentRoomInfo = info
                                 isHosting = true
                                 startHeartbeat()
-                                // 保持纯净加载屏，后台重开播，直到开播成功再展示放歌 UI
                                 postRoomState(info, action = "start", isResume = true)
                             } else {
                                 isHosting = false
                                 stopHeartbeat()
-                                updateRoomUi(false, null, null, null, null)
+                                updateRoomUi(false, null, null, null, null, null, null)
                             }
                         }
                         startPollingRoomStatus()
                     }
                 } else {
-                    Log.w(TAG, "进入房间探测未成功: code=${response.code}")
                     withContext(Dispatchers.Main) {
                         if (!isHosting) {
-                            updateRoomUi(false, null, null, null, null)
+                            updateRoomUi(false, null, null, null, null, null, null)
                         } else {
-                            // 房主端：若探测请求未成功，兜底恢复放歌 UI，避免死锁在加载态
                             val myUsername = sessionManager.getUsername()
                             updateRoomUi(
                                 exists = true,
                                 inviter = currentRoomInfo?.inviter ?: myUsername,
                                 publisher = myUsername,
                                 hostAvatarUrl = sessionManager.getAvatarUri(),
-                                deepLink = currentRoomInfo?.rawUri
+                                deepLink = currentRoomInfo?.rawUri,
+                                currentSong = currentRoomInfo?.currentSong,
+                                currentCover = currentRoomInfo?.currentCover
                             )
                         }
                         startPollingRoomStatus()
@@ -794,7 +703,7 @@ class MainActivity : AppCompatActivity() {
                 Log.w(TAG, "探测异常: ${e.message}")
                 withContext(Dispatchers.Main) {
                     if (!isHosting) {
-                        updateRoomUi(false, null, null, null, null)
+                        updateRoomUi(false, null, null, null, null, null, null)
                     } else {
                         val myUsername = sessionManager.getUsername()
                         updateRoomUi(
@@ -802,7 +711,9 @@ class MainActivity : AppCompatActivity() {
                             inviter = currentRoomInfo?.inviter ?: myUsername,
                             publisher = myUsername,
                             hostAvatarUrl = sessionManager.getAvatarUri(),
-                            deepLink = currentRoomInfo?.rawUri
+                            deepLink = currentRoomInfo?.rawUri,
+                            currentSong = currentRoomInfo?.currentSong,
+                            currentCover = currentRoomInfo?.currentCover
                         )
                     }
                     startPollingRoomStatus()
@@ -811,19 +722,67 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // 🚀 本地平滑推进与自动切歌
+    private fun startProgressTicker() {
+        if (progressTickerJob?.isActive == true) return
+        progressTickerJob = lifecycleScope.launch(Dispatchers.Main) {
+            while (isActive) {
+                updateProgressSmoothly()
+                delay(500)
+            }
+        }
+    }
+
+    private fun stopProgressTicker() {
+        progressTickerJob?.cancel()
+        progressTickerJob = null
+    }
+
+    private fun updateProgressSmoothly() {
+        if (durationMs <= 0) {
+            pbPlayerProgress.progress = 0
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val currentPosition = if (isPlaying && baseTimestampMs > 0) {
+            val elapsed = ((now - baseTimestampMs) * playbackRate).toLong()
+            (basePositionMs + elapsed).coerceAtLeast(0L)
+        } else {
+            basePositionMs
+        }
+
+        // 🎵 自然播完：达到或超过歌曲总时长，触发拉取下一首！
+        if (currentPosition >= durationMs && isPlaying) {
+            pbPlayerProgress.progress = 1000
+            lifecycleScope.launch(Dispatchers.IO) {
+                fetchRoomStatusSequential()
+            }
+            return
+        }
+
+        val ratio = (currentPosition.toDouble() / durationMs.toDouble()).coerceIn(0.0, 1.0)
+        pbPlayerProgress.progress = (ratio * 1000).toInt()
+    }
+
     @SuppressLint("SetTextI18n")
     private fun updateRoomUi(
         exists: Boolean,
         inviter: String?,
         publisher: String?,
         hostAvatarUrl: String?,
-        deepLink: String?
+        deepLink: String?,
+        currentSong: String? = null,
+        currentCover: String? = null,
+        durationMs: Long = 0L,
+        basePositionMs: Long = 0L,
+        baseTimestampMs: Long = 0L,
+        playbackRate: Double = 1.0,
+        isPlaying: Boolean = true
     ) {
         if (!exists && isPublishing) return
 
-        switchAnimation(ANIM_HEX)
-
-        // 探测完成，恢复文字展示
+        switchAnimation(AnimationTemplates.ANIM_HEX)
         tvHostMessage.visibility = View.VISIBLE
 
         if (!exists) {
@@ -831,18 +790,56 @@ class MainActivity : AppCompatActivity() {
             currentRoomInfo = null
             isHosting = false
             stopHeartbeat()
+            stopProgressTicker()
 
             tvHostMessage.text = "空闲"
+            layoutAudioPlayerCard.visibility = View.GONE
             ivHostAvatar.visibility = View.GONE
             btnJoin.visibility = View.GONE
             layoutHostSection.visibility = View.VISIBLE
         } else {
             currentDeepLink = deepLink
-
             val myUsername = sessionManager.getUsername()
             val isMe = sessionManager.isLoggedIn() && (myUsername == publisher || myUsername == inviter)
 
             tvHostMessage.text = if (isMe) "你正在放歌" else "${inviter ?: "群友"} 正在放歌"
+
+            // 🎵 渲染 Spotify 风格暗黑卡片
+            if (!currentSong.isNullOrBlank()) {
+                layoutAudioPlayerCard.visibility = View.VISIBLE
+
+                val parts = currentSong.split(" - ")
+                val songTitle = parts.getOrNull(0) ?: currentSong
+                val songArtist = parts.getOrNull(1) ?: "NeriPlayer 同步中"
+
+                tvPlayerSongTitle.text = songTitle
+                tvPlayerArtist.text = songArtist
+                tvPlayerSongTitle.isSelected = true
+
+                if (!currentCover.isNullOrEmpty()) {
+                    ivPlayerAlbumCover.load(currentCover) {
+                        crossfade(true)
+                        placeholder(R.drawable.bg_avatar_gray)
+                        error(R.drawable.bg_avatar_gray)
+                        transformations(CircleCropTransformation())
+                    }
+                } else {
+                    ivPlayerAlbumCover.setImageResource(R.drawable.bg_avatar_gray)
+                }
+
+                // 注入并启动平滑计算
+                this.durationMs = durationMs
+                this.basePositionMs = basePositionMs
+                this.baseTimestampMs = baseTimestampMs
+                this.playbackRate = playbackRate
+                this.isPlaying = isPlaying
+
+                updateProgressSmoothly()
+                startProgressTicker()
+            } else {
+                stopProgressTicker()
+                layoutAudioPlayerCard.visibility = View.GONE
+            }
 
             ivHostAvatar.visibility = View.VISIBLE
             if (!hostAvatarUrl.isNullOrEmpty()) {
@@ -875,7 +872,7 @@ class MainActivity : AppCompatActivity() {
 
         isPublishing = true
         btnPublishRoom.isEnabled = false
-        btnPublishRoom.text = "核验开启中..."
+        btnPublishRoom.text = "开启中..."
         btnPasteInvite.isEnabled = false
         etInviteCode.isEnabled = false
 
@@ -903,10 +900,7 @@ class MainActivity : AppCompatActivity() {
             put("username", sessionManager.getUsername())
         }
         val requestBody = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-        val request = Request.Builder()
-            .url("$BASE_URL/room/broadcast")
-            .post(requestBody)
-            .build()
+        val request = Request.Builder().url("$BASE_URL/room/broadcast").post(requestBody).build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
@@ -933,7 +927,7 @@ class MainActivity : AppCompatActivity() {
             isHosting = false
             stopHeartbeat()
             sessionManager.clearHostingRoom()
-            updateRoomUi(false, null, null, null, null)
+            updateRoomUi(false, null, null, null, null, null, null)
             showTip("房间已解散")
             return
         }
@@ -959,10 +953,7 @@ class MainActivity : AppCompatActivity() {
     private suspend fun fetchRoomStatusSequential() = withContext(Dispatchers.IO) {
         if (isPublishing) return@withContext
 
-        val request = Request.Builder()
-            .url("$BASE_URL/room/status")
-            .get()
-            .build()
+        val request = Request.Builder().url("$BASE_URL/room/status").get().build()
 
         try {
             val response = client.newCall(request).execute()
@@ -975,14 +966,37 @@ class MainActivity : AppCompatActivity() {
                 val publisher = json.optString("publisher", "")
                 val hostAvatarUrl = json.optString("hostAvatarUrl", "")
                 val deepLink = json.optString("deepLink", "")
+                val currentSong = json.optString("currentSong", "").ifEmpty { null }
+                val currentCover = json.optString("currentCover", "").ifEmpty { null }
+                val durationMs = json.optLong("durationMs", 0L)
+                val basePositionMs = json.optLong("basePositionMs", 0L)
+                val baseTimestampMs = json.optLong("baseTimestampMs", System.currentTimeMillis())
+                val playbackRate = json.optDouble("playbackRate", 1.0)
+                val isPlaying = json.optBoolean("isPlaying", true)
 
                 withContext(Dispatchers.Main) {
                     if (isPublishing) return@withContext
 
                     if (exists && deepLink.isNotEmpty()) {
                         roomMissCount = 0
-                        currentRoomInfo = NeriDeepLinkHelper.parseInvitation(deepLink)
-                        updateRoomUi(true, inviter, publisher, hostAvatarUrl, deepLink)
+                        currentRoomInfo = NeriDeepLinkHelper.parseInvitation(deepLink)?.copy(
+                            currentSong = currentSong,
+                            currentCover = currentCover
+                        )
+                        updateRoomUi(
+                            exists = true,
+                            inviter = inviter,
+                            publisher = publisher,
+                            hostAvatarUrl = hostAvatarUrl,
+                            deepLink = deepLink,
+                            currentSong = currentSong,
+                            currentCover = currentCover,
+                            durationMs = durationMs,
+                            basePositionMs = basePositionMs,
+                            baseTimestampMs = baseTimestampMs,
+                            playbackRate = playbackRate,
+                            isPlaying = isPlaying
+                        )
                     } else {
                         roomMissCount++
                         if (roomMissCount >= ROOM_MISS_THRESHOLD) {
@@ -991,12 +1005,10 @@ class MainActivity : AppCompatActivity() {
                                 isHosting = false
                                 stopHeartbeat()
                             }
-                            updateRoomUi(false, null, null, null, null)
+                            updateRoomUi(false, null, null, null, null, null, null)
                         }
                     }
                 }
-            } else {
-                Log.w(TAG, "查询未成功: code=${response.code}")
             }
         } catch (e: Exception) {
             Log.w(TAG, "轮询网络波动: ${e.message}")
@@ -1021,10 +1033,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val requestBody = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-        val request = Request.Builder()
-            .url("$BASE_URL/room/broadcast")
-            .post(requestBody)
-            .build()
+        val request = Request.Builder().url("$BASE_URL/room/broadcast").post(requestBody).build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
@@ -1036,7 +1045,7 @@ class MainActivity : AppCompatActivity() {
                         btnPublishRoom.text = "开启"
                         btnPasteInvite.isEnabled = true
                         etInviteCode.isEnabled = true
-                        showTip("网络连接超时")
+                        showTip("网络连接超时，开启失败")
                     }
                 }
             }
@@ -1065,18 +1074,42 @@ class MainActivity : AppCompatActivity() {
                                 isHosting = false
                                 stopHeartbeat()
                                 if (isResume) {
-                                    updateRoomUi(false, null, null, null, null)
+                                    updateRoomUi(false, null, null, null, null, null, null)
                                 }
                             }
                             showTip(errMsg)
                         } else {
                             etInviteCode.setText("")
                             isHosting = true
-                            currentRoomInfo = info
+
+                            var returnedSong: String? = null
+                            var returnedCover: String? = null
+                            var durationMs = 0L
+                            var basePositionMs = 0L
+                            var baseTimestampMs = System.currentTimeMillis()
+                            var playbackRate = 1.0
+                            var isPlaying = true
+
+                            try {
+                                val resData = JSONObject(respBody).optJSONObject("data")
+                                returnedSong = resData?.optString("currentSong", "")?.ifEmpty { null }
+                                returnedCover = resData?.optString("currentCover", "")?.ifEmpty { null }
+                                durationMs = resData?.optLong("durationMs", 0L) ?: 0L
+                                basePositionMs = resData?.optLong("basePositionMs", 0L) ?: 0L
+                                baseTimestampMs = resData?.optLong("baseTimestampMs", System.currentTimeMillis()) ?: System.currentTimeMillis()
+                                playbackRate = resData?.optDouble("playbackRate", 1.0) ?: 1.0
+                                isPlaying = resData?.optBoolean("isPlaying", true) ?: true
+                            } catch (_: Exception) {}
+
+                            val updatedInfo = info?.copy(
+                                currentSong = returnedSong,
+                                currentCover = returnedCover
+                            )
+                            currentRoomInfo = updatedInfo
                             roomMissCount = 0
                             hostRetryCount = 0
 
-                            info?.let { persistHostingRoom(it) }
+                            updatedInfo?.let { persistHostingRoom(it) }
 
                             val myUsername = sessionManager.getUsername()
                             updateRoomUi(
@@ -1084,362 +1117,25 @@ class MainActivity : AppCompatActivity() {
                                 inviter = effectiveInviter,
                                 publisher = myUsername,
                                 hostAvatarUrl = sessionManager.getAvatarUri(),
-                                deepLink = info?.rawUri
+                                deepLink = info?.rawUri,
+                                currentSong = returnedSong,
+                                currentCover = returnedCover,
+                                durationMs = durationMs,
+                                basePositionMs = basePositionMs,
+                                baseTimestampMs = baseTimestampMs,
+                                playbackRate = playbackRate,
+                                isPlaying = isPlaying
                             )
 
                             startHeartbeat()
 
-                            // 手动开启时提示上线成功
                             if (!isResume) {
-                                showTip("成功")
+                                showTip("房间上线成功！")
                             }
                         }
                     }
                 }
             }
         })
-    }
-
-    private fun getDotSpinnerHtml(): String {
-        return """
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-        <style>
-          * { box-sizing: border-box; }
-          body {
-            margin: 0; padding: 0; background: transparent; overflow: hidden;
-            display: flex; justify-content: center; align-items: center; height: 100vh;
-          }
-          .spinner {
-            position: relative;
-            width: 60px;
-            height: 60px;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            border-radius: 50%;
-            margin-left: -75px;
-          }
-
-          .spinner span {
-            position: absolute;
-            top: 50%;
-            left: var(--left);
-            width: 35px;
-            height: 7px;
-            background: #ffff;
-            animation: dominos 1s ease infinite;
-            box-shadow: 2px 2px 3px 0px black;
-          }
-
-          .spinner span:nth-child(1) {
-            --left: 80px;
-            animation-delay: 0.125s;
-          }
-
-          .spinner span:nth-child(2) {
-            --left: 70px;
-            animation-delay: 0.3s;
-          }
-
-          .spinner span:nth-child(3) {
-            left: 60px;
-            animation-delay: 0.425s;
-          }
-
-          .spinner span:nth-child(4) {
-            animation-delay: 0.54s;
-            left: 50px;
-          }
-
-          .spinner span:nth-child(5) {
-            animation-delay: 0.665s;
-            left: 40px;
-          }
-
-          .spinner span:nth-child(6) {
-            animation-delay: 0.79s;
-            left: 30px;
-          }
-
-          .spinner span:nth-child(7) {
-            animation-delay: 0.915s;
-            left: 20px;
-          }
-
-          .spinner span:nth-child(8) {
-            left: 10px;
-          }
-
-          @keyframes dominos {
-            50% {
-              opacity: 0.7;
-            }
-
-            75% {
-              -webkit-transform: rotate(90deg);
-              transform: rotate(90deg);
-            }
-
-            80% {
-              opacity: 1;
-            }
-          }
-        </style>
-        </head>
-        <body>
-          <div class="spinner">
-            <span></span>
-            <span></span>
-            <span></span>
-            <span></span>
-            <span></span>
-            <span></span>
-            <span></span>
-            <span></span>
-          </div>
-        </body>
-        </html>
-        """.trimIndent()
-    }
-
-    private fun getHexLoaderHtml(): String {
-        return """
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-        <style>
-          * { box-sizing: border-box; }
-          body {
-            margin: 0; padding: 0; background: transparent; overflow: hidden;
-            display: flex; justify-content: center; align-items: center; height: 100vh;
-          }
-          .socket {
-            width: 200px; height: 200px; position: relative;
-            transform: scale(0.62);
-          }
-          .hex-brick {
-            background: #0F172A; width: 30px; height: 17px; position: absolute; top: 5px;
-            animation: fade00 2s infinite; -webkit-animation: fade00 2s infinite;
-          }
-          .h2 { transform: rotate(60deg); -webkit-transform: rotate(60deg); }
-          .h3 { transform: rotate(-60deg); -webkit-transform: rotate(-60deg); }
-          .gel { height: 30px; width: 30px; position: absolute; top: 50%; left: 50%; }
-          .center-gel {
-            margin-left: -15px; margin-top: -15px;
-            animation: pulse00 2s infinite; -webkit-animation: pulse00 2s infinite;
-          }
-          .c1 { margin-left: -47px; margin-top: -15px; }
-          .c2 { margin-left: -31px; margin-top: -43px; }
-          .c3 { margin-left: 1px; margin-top: -43px; }
-          .c4 { margin-left: 17px; margin-top: -15px; }
-          .c5 { margin-left: -31px; margin-top: 13px; }
-          .c6 { margin-left: 1px; margin-top: 13px; }
-          .c7 { margin-left: -63px; margin-top: -43px; }
-          .c8 { margin-left: 33px; margin-top: -43px; }
-          .c9 { margin-left: -15px; margin-top: 41px; }
-          .c10 { margin-left: -63px; margin-top: 13px; }
-          .c11 { margin-left: 33px; margin-top: 13px; }
-          .c12 { margin-left: -15px; margin-top: -71px; }
-          .c13 { margin-left: -47px; margin-top: -71px; }
-          .c14 { margin-left: 17px; margin-top: -71px; }
-          .c15 { margin-left: -47px; margin-top: 41px; }
-          .c16 { margin-left: 17px; margin-top: 41px; }
-          .c17 { margin-left: -79px; margin-top: -15px; }
-          .c18 { margin-left: 49px; margin-top: -15px; }
-          .c19 { margin-left: -63px; margin-top: -99px; }
-          .c20 { margin-left: 33px; margin-top: -99px; }
-          .c21 { margin-left: 1px; margin-top: -99px; }
-          .c22 { margin-left: -31px; margin-top: -99px; }
-          .c23 { margin-left: -63px; margin-top: 69px; }
-          .c24 { margin-left: 33px; margin-top: 69px; }
-          .c25 { margin-left: 1px; margin-top: 69px; }
-          .c26 { margin-left: -31px; margin-top: 69px; }
-          .c27 { margin-left: -79px; margin-top: -15px; }
-          .c28 { margin-left: -95px; margin-top: -43px; }
-          .c29 { margin-left: -95px; margin-top: 13px; }
-          .c30 { margin-left: 49px; margin-top: 41px; }
-          .c31 { margin-left: -79px; margin-top: -71px; }
-          .c32 { margin-left: -111px; margin-top: -15px; }
-          .c33 { margin-left: 65px; margin-top: -43px; }
-          .c34 { margin-left: 65px; margin-top: 13px; }
-          .c35 { margin-left: -79px; margin-top: 41px; }
-          .c36 { margin-left: 49px; margin-top: -71px; }
-          .c37 { margin-left: 81px; margin-top: -15px; }
-
-          .r1 { animation: pulse00 2s infinite .2s; }
-          .r2 { animation: pulse00 2s infinite .4s; }
-          .r3 { animation: pulse00 2s infinite .6s; }
-          .r1 > .hex-brick { animation: fade00 2s infinite .2s; }
-          .r2 > .hex-brick { animation: fade00 2s infinite .4s; }
-          .r3 > .hex-brick { animation: fade00 2s infinite .6s; }
-
-          @keyframes pulse00 {
-            0% { transform: scale(1); }
-            50% { transform: scale(0.01); }
-            100% { transform: scale(1); }
-          }
-          @keyframes fade00 {
-            0% { background: #334155; }
-            50% { background: #0F172A; }
-            100% { background: #64748B; }
-          }
-        </style>
-        </head>
-        <body>
-          <div class="socket">
-            <div class="gel center-gel"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c1 r1"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c2 r1"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c3 r1"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c4 r1"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c5 r1"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c6 r1"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c7 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c8 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c9 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c10 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c11 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c12 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c13 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c14 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c15 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c16 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c17 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c18 r2"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c19 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c20 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c21 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c22 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c23 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c24 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c25 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c26 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c27 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c28 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c29 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c30 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c31 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c32 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c33 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c34 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c35 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c36 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-            <div class="gel c37 r3"><div class="hex-brick h1"></div><div class="hex-brick h2"></div><div class="hex-brick h3"></div></div>
-          </div>
-        </body>
-        </html>
-        """.trimIndent()
-    }
-}
-
-// =========================================================================
-// 核心实体与工具类
-// =========================================================================
-data class RoomInfo(
-    val rawUri: String,
-    val roomId: String?,
-    val inviter: String?,
-    val secret: String?,
-    val serverUrl: String?
-)
-
-object NeriDeepLinkHelper {
-    private val SCHEME_REGEX = Pattern.compile("neriplayer://[\\w\\-./?%&=:#@+~]+")
-
-    fun parseInvitation(text: String): RoomInfo? {
-        val matcher = SCHEME_REGEX.matcher(text)
-        if (!matcher.find()) return null
-
-        val uriString = matcher.group() ?: return null
-        return try {
-            val uri = uriString.toUri()
-            RoomInfo(
-                rawUri = uriString,
-                roomId = uri.getQueryParameter("roomId"),
-                inviter = uri.getQueryParameter("inviter"),
-                secret = uri.getQueryParameter("secret"),
-                serverUrl = uri.getQueryParameter("server") ?: uri.getQueryParameter("baseUrl")
-            )
-        } catch (e: Exception) {
-            Log.e("DeepLinkHelper", "URI 解析异常", e)
-            null
-        }
-    }
-
-    fun launchPlayer(context: Context, deepLink: String): Boolean {
-        return try {
-            val intent = Intent(Intent.ACTION_VIEW, deepLink.toUri()).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            }
-            context.startActivity(intent)
-            true
-        } catch (e: ActivityNotFoundException) {
-            Log.w("DeepLinkHelper", "未安装 NeriPlayer", e)
-            false
-        }
-    }
-}
-
-class SessionManager(context: Context) {
-    private val prefs: SharedPreferences =
-        context.getSharedPreferences("user_session_pref", Context.MODE_PRIVATE)
-
-    companion object {
-        private const val KEY_TOKEN = "jwt_token"
-        private const val KEY_USERNAME = "auth_username"
-        private const val KEY_AVATAR_URI = "auth_avatar_uri"
-        private const val KEY_HOSTING_ROOM = "hosting_room_json"
-    }
-
-    fun saveAuthToken(token: String, username: String) {
-        prefs.edit {
-            putString(KEY_TOKEN, token)
-            putString(KEY_USERNAME, username)
-        }
-    }
-
-    fun saveUsername(username: String) {
-        prefs.edit { putString(KEY_USERNAME, username) }
-    }
-
-    fun getUsername(): String {
-        return prefs.getString(KEY_USERNAME, "未登录") ?: "未登录"
-    }
-
-    fun saveAvatarUri(uri: String) {
-        prefs.edit { putString(KEY_AVATAR_URI, uri) }
-    }
-
-    fun getAvatarUri(): String? {
-        return prefs.getString(KEY_AVATAR_URI, null)
-    }
-
-    fun isLoggedIn(): Boolean {
-        return !prefs.getString(KEY_TOKEN, null).isNullOrEmpty()
-    }
-
-    // ===== 房主身份持久化 =====
-    fun saveHostingRoom(json: String) {
-        prefs.edit { putString(KEY_HOSTING_ROOM, json) }
-    }
-
-    fun getHostingRoom(): String? {
-        return prefs.getString(KEY_HOSTING_ROOM, null)
-    }
-
-    fun clearHostingRoom() {
-        prefs.edit { remove(KEY_HOSTING_ROOM) }
-    }
-
-    fun clearSession() {
-        prefs.edit { clear() }
-    }
-
-    fun getToken(): String? {
-        return prefs.getString(KEY_TOKEN, null)
     }
 }

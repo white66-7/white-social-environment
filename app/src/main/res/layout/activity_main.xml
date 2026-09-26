@@ -95,8 +95,8 @@
                         android:layout_height="wrap_content"
                         android:gravity="center_horizontal"
                         android:orientation="vertical"
-                        android:paddingHorizontal="24dp"
-                        android:paddingVertical="20dp">
+                        android:paddingHorizontal="16dp"
+                        android:paddingVertical="16dp">
 
                         <WebView
                             android:id="@+id/webHexLoader"
@@ -126,6 +126,85 @@
                             android:textSize="19sp"
                             android:textStyle="bold" />
 
+                        <!-- 🎵 优化后的 Spotify 播放器卡片：自适应宽度与高度，居中舒展 -->
+                        <com.google.android.material.card.MaterialCardView
+                            android:id="@+id/layoutAudioPlayerCard"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginHorizontal="16dp"
+                            android:layout_marginTop="16dp"
+                            android:visibility="gone"
+                            app:cardBackgroundColor="#282828"
+                            app:cardCornerRadius="10dp"
+                            app:cardElevation="3dp"
+                            app:strokeWidth="0dp">
+
+                            <LinearLayout
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:gravity="center_vertical"
+                                android:orientation="horizontal"
+                                android:padding="10dp">
+
+                                <!-- 圆形专辑封面 52x52，保持与整体平衡 -->
+                                <com.google.android.material.imageview.ShapeableImageView
+                                    android:id="@+id/ivPlayerAlbumCover"
+                                    android:layout_width="52dp"
+                                    android:layout_height="52dp"
+                                    android:layout_marginEnd="12dp"
+                                    android:scaleType="centerCrop"
+                                    app:shapeAppearanceOverlay="@style/ShapeAppearance.Material3.Corner.Full"
+                                    app:srcCompat="@drawable/bg_avatar_gray" />
+
+                                <!-- 右侧信息与进度条 -->
+                                <LinearLayout
+                                    android:layout_width="0dp"
+                                    android:layout_height="wrap_content"
+                                    android:layout_weight="1"
+                                    android:orientation="vertical">
+
+                                    <!-- 歌名宽度铺满并限制单行，确保跑马灯滚动顺畅不重叠 -->
+                                    <TextView
+                                        android:id="@+id/tvPlayerSongTitle"
+                                        android:layout_width="match_parent"
+                                        android:layout_height="wrap_content"
+                                        android:ellipsize="marquee"
+                                        android:focusable="true"
+                                        android:focusableInTouchMode="true"
+                                        android:marqueeRepeatLimit="marquee_forever"
+                                        android:scrollHorizontally="true"
+                                        android:singleLine="true"
+                                        android:text="Song Title"
+                                        android:textColor="#FFFFFF"
+                                        android:textSize="14sp"
+                                        android:textStyle="bold" />
+
+                                    <TextView
+                                        android:id="@+id/tvPlayerArtist"
+                                        android:layout_width="match_parent"
+                                        android:layout_height="wrap_content"
+                                        android:layout_marginTop="2dp"
+                                        android:layout_marginBottom="8dp"
+                                        android:ellipsize="end"
+                                        android:singleLine="true"
+                                        android:text="Artist"
+                                        android:textColor="#B3B3B3"
+                                        android:textSize="12sp" />
+
+                                    <!-- 进度条（下边距收敛，视觉更精致） -->
+                                    <ProgressBar
+                                        android:id="@+id/pbPlayerProgress"
+                                        style="?android:attr/progressBarStyleHorizontal"
+                                        android:layout_width="match_parent"
+                                        android:layout_height="3dp"
+                                        android:max="1000"
+                                        android:progress="0"
+                                        android:progressBackgroundTint="#4D4D4D"
+                                        android:progressTint="#1DB954" />
+                                </LinearLayout>
+                            </LinearLayout>
+                        </com.google.android.material.card.MaterialCardView>
+
                         <com.google.android.material.button.MaterialButton
                             android:id="@+id/btnJoin"
                             android:layout_width="match_parent"
@@ -139,23 +218,11 @@
                             app:backgroundTint="#0F172A"
                             app:cornerRadius="12dp" />
 
-                        <com.google.android.material.button.MaterialButton
-                            android:id="@+id/btnStopHosting"
-                            style="?attr/materialButtonOutlinedStyle"
-                            android:layout_width="match_parent"
-                            android:layout_height="44dp"
-                            android:layout_marginTop="10dp"
-                            android:text="结束放歌"
-                            android:textColor="#EF4444"
-                            android:textSize="13sp"
-                            android:visibility="gone"
-                            app:cornerRadius="12dp"
-                            app:strokeColor="#FECACA" />
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
             </FrameLayout>
 
-            <!-- 发起框：增加 marginBottom 使其整体向上提 -->
+            <!-- 发起框：整体向上提 -->
             <LinearLayout
                 android:id="@+id/layoutHostSection"
                 android:layout_width="match_parent"
