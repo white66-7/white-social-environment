@@ -20,68 +20,121 @@ import androidx.lifecycle.lifecycleScope
 import coil.load
 import coil.transform.CircleCropTransformation
 import com.example.social_music.manager.PlaybackProgressTracker
-import com.example.social_music.model.RegisteredMember
+import com.example.social_music.model.ActiveRoom
+import com.example.social_music.model.MemberInfo
+import com.example.social_music.model.PlaybackPayload
 import com.example.social_music.model.RoomInfo
+import com.example.social_music.model.RoomSnapshot
+import com.example.social_music.net.ApiConfig
 import com.example.social_music.net.NeriRealtimeWatcher
+import com.example.social_music.net.ProfileOutcome
+import com.example.social_music.net.PushOutcome
 import com.example.social_music.net.RoomApiService
+import com.example.social_music.net.RoomRealtimeClient
+import com.example.social_music.net.StartOutcome
+import com.example.social_music.net.StateOutcome
 import com.example.social_music.utils.AnimationTemplates
 import com.example.social_music.utils.CapsuleTipManager
 import com.example.social_music.utils.NeriDeepLinkHelper
 import com.example.social_music.utils.SessionManager
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.imageview.ShapeableImageView
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
-import kotlin.time.Duration.Companion.seconds
 
+/**
+ * 单一权威状态来源：服务端快照。
+ *
+ * 这次重构删掉了两样东西：
+ *  1. 6~10 秒一轮的房间状态轮询 —— 改成 RoomRealtimeClient 的一条长连接推送；
+ *  2. 用一堆散落的布尔标志位（isHosting / currentDeepLink / roomMissCount /
+ *     currentSongTimestamp…）互相打架来推断界面 —— 改成 render(snapshot) 单向渲染。
+ *
+ * 界面结构与控件完全沿用原有布局，没有改动 UI。
+ */
 class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
-        // ⚡ 容错率提升为 3 次，防止网络抖动误解散
-        private const val ROOM_MISS_THRESHOLD = 3
-        private const val MAX_HOST_RETRY = 3
+        private const val MAX_HOST_REVIVE = 3
+        private const val HOST_KEEPALIVE_INTERVAL_MS = 20_000L
+
+        /**
+         * 房主记录的有效期。超过这个时间就不再自动重新挂载房间 ——
+         * 否则「昨天开过房、今天打开 App」会凭空拉起一个没人听的僵尸房间。
+         */
+        private const val HOST_RECORD_MAX_AGE_MS = 30 * 60 * 1000L
+
+        /** 刷新房主记录时间戳的最小间隔，避免每 20 秒就写一次 SharedPreferences */
+        private const val RECORD_REFRESH_INTERVAL_MS = 5 * 60 * 1000L
+
+        /** 花名册缓存时长：名单很少变，在线角标走长连接实时刷新，不必频繁重拉 */
+        private const val ROSTER_CACHE_MS = 30_000L
+
+        /** 主动关房后的静默窗口，用来吞掉自己触发的那条 room_closed 提示 */
+        private const val ROOM_CLOSED_SUPPRESS_MS = 5_000L
     }
 
-    private val apiService = RoomApiService()
+    // ---------- 依赖 ----------
+    private val api = RoomApiService()
     private lateinit var sessionManager: SessionManager
     private lateinit var tipManager: CapsuleTipManager
     private lateinit var progressTracker: PlaybackProgressTracker
+    private lateinit var realtime: RoomRealtimeClient
 
-    // ⚡ Neri WebSocket 毫秒级长连接监听器
+    /** 只在房主身份下启用：连 NeriPlayer 感知切歌。成员端绝不连，避免房间里多出机器人 */
     private lateinit var neriWatcher: NeriRealtimeWatcher
 
-    private var currentDeepLink: String? = null
-    private var currentRoomInfo: RoomInfo? = null
+    // ---------- 权威状态 ----------
+    private var snapshot: RoomSnapshot? = null
+
+    /**
+     * 快照排序依据，独立于 snapshot 保存。
+     * room_closed 只带版本号不带快照，如果直接写回 snapshot.version，
+     * 一条迟到的 REST 快照就能用同一个版本号把已经关掉的房间又画回来。
+     */
+    private var lastVersion = 0L
+    private var hasRenderedOnce = false
+    private var wasLoggedIn = false
+
+    // ---------- 花名册（全部注册成员）----------
+    private val roster = mutableListOf<MemberInfo>()
+    private var rosterLoaded = false
+    private var rosterError: String? = null
+    private var rosterJob: Job? = null
+    private var lastRosterFetchAt = 0L
+
+    // 实时状态：由长连接快照刷新，用来给花名册打角标
+    private var onlineQq: Set<String> = emptySet()
+    private var hostQq: String? = null
+
+    // ---------- 房主本地状态 ----------
+    /** 本地是否正以房主身份向服务器上报（决定是否维持 Neri 长连接与保活循环） */
     private var isHosting = false
-    private var currentAnimType = AnimationTemplates.ANIM_NONE
-
     private var isPublishing = false
-    private var roomMissCount = 0
-    private var hostRetryCount = 0
+    private var isRevivingHost = false
+    private var hostReviveCount = 0
+    private var currentRoomInfo: RoomInfo? = null
+    private var lastRecordRefreshAt = 0L
 
-    // 🎵 记录当前最新的播放指标（用于房主向服务器同步歌曲）
+    /** 主动关房后的静默截止时间 */
+    private var suppressRoomClosedUntil = 0L
+
+    // 房主端渲染用的是 Neri 回调的本地数据，零延迟
     private var liveSongTitle: String? = null
     private var liveArtist: String? = null
     private var liveCoverUrl: String? = null
-    private var liveDurationMs: Long = 0L
-    private var liveBasePosMs: Long = 0L
-    private var liveIsPlaying: Boolean = true
+    private var liveDurationMs = 0L
+    private var liveBasePosMs = 0L
+    private var liveAnchorAtMs = 0L
+    private var liveIsPlaying = false
 
-    // 协程任务控制
-    private var initProbeJob: Job? = null
-    private var pollingJob: Job? = null
-    private var heartbeatJob: Job? = null
-    private var fetchMembersJob: Job? = null
-
-    // 👥 成员数据内存缓存与防抖
-    private var cachedMembers: List<RegisteredMember>? = null
-    private var lastFetchMembersTime: Long = 0L
+    // ---------- 任务 ----------
+    private var bootstrapJob: Job? = null
+    private var hostKeepaliveJob: Job? = null
 
     // 全局顶部控件
     private lateinit var ivUserAvatar: ShapeableImageView
@@ -119,59 +172,78 @@ class MainActivity : AppCompatActivity() {
     private lateinit var layoutMembersContainer: LinearLayout
     private var webMembersLoader: WebView? = null
 
+    // ==========================================================
+    // 生命周期
+    // ==========================================================
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         sessionManager = SessionManager(this)
         tipManager = CapsuleTipManager(this)
+        wasLoggedIn = sessionManager.isLoggedIn()
 
         initViews()
         initWebViewSettings()
         initProgressTracker()
-        initRealtimeWatcher()
+        initRealtime()
+        initNeriWatcher()
         setupListeners()
 
-        showLoadingState()
-        restoreHostingStateIfAny()
+        renderInitialState()
+        if (wasLoggedIn) bootstrap()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        connectRealtimeIfPossible()
     }
 
     override fun onResume() {
         super.onResume()
         updateUserUi()
 
-        if (currentRoomInfo == null && currentDeepLink == null) {
-            showLoadingState()
+        // ⚡ 切回前台立刻按服务器时基补齐后台期间走过的进度
+        progressTracker.resume()
+
+        val loggedInNow = sessionManager.isLoggedIn()
+        if (loggedInNow != wasLoggedIn) {
+            wasLoggedIn = loggedInNow
+            if (loggedInNow) onLoggedIn() else onLoggedOut()
         }
 
-        checkAndProbeRoomOnEntry()
-
-        if (layoutMembersTabContent.isVisible) {
-            fetchRegisteredMembers()
+        if (loggedInNow) {
+            connectRealtimeIfPossible()
+            refreshMembersTab()
         }
     }
 
     override fun onStop() {
         super.onStop()
-        // ⚡ 核心修复：如果是房主，切到播放器切歌时，绝对不能停止 WebSocket 监听！
+
+        // 实时通道只服务于前台画面，切后台断开省电。
+        // 房主的状态上报走 HTTP，不受影响；而且服务端会强制把房主留在成员列表里。
+        realtime.disconnect()
+
+        progressTracker.pause()
+
+        // 房主在放歌时，切到外部播放器切歌绝不能断开 Neri 长连接
         if (!isHosting) {
             neriWatcher.stopWatching()
         }
-        progressTracker.stop()
-        initProbeJob?.cancel()
-        pollingJob?.cancel()
-        pollingJob = null
-        fetchMembersJob?.cancel()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+
+        // 刻意不在这里关房、也不清房主持久化记录：
+        // 转屏或 Activity 回收不该把正在放歌的房间打掉，
+        // 真正的兜底是服务端 90 秒心跳超时。
+        hostKeepaliveJob?.cancel()
+        bootstrapJob?.cancel()
         neriWatcher.stopWatching()
-        stopHeartbeat()
-        progressTracker.stop()
-        initProbeJob?.cancel()
-        pollingJob?.cancel()
-        fetchMembersJob?.cancel()
+        realtime.disconnect()
 
         (webHexLoader.parent as? ViewGroup)?.removeView(webHexLoader)
         webHexLoader.loadDataWithBaseURL(null, "", "text/html", "utf-8", null)
@@ -183,12 +255,65 @@ class MainActivity : AppCompatActivity() {
             it.loadDataWithBaseURL(null, "", "text/html", "utf-8", null)
             it.clearHistory()
             it.destroy()
-            webMembersLoader = null
         }
+        webMembersLoader = null
     }
 
-    private fun showTip(message: String) = tipManager.showTip(message)
-    private fun dp2px(dp: Int): Int = (dp * resources.displayMetrics.density + 0.5f).toInt()
+    // ==========================================================
+    // 初始化
+    // ==========================================================
+
+    private fun initProgressTracker() {
+        progressTracker = PlaybackProgressTracker(
+            scope = lifecycleScope,
+            onProgressTick = { ratio ->
+                pbPlayerProgress.progress = (ratio * 1000).toInt()
+            },
+            onSongFinished = {}
+        )
+    }
+
+    private fun initRealtime() {
+        realtime = RoomRealtimeClient(object : RoomRealtimeClient.Listener {
+
+            override fun onSnapshot(incoming: RoomSnapshot) {
+                applySnapshot(incoming)
+            }
+
+            override fun onRoomClosed(reason: String, version: Long) {
+                handleServerRoomClosed(reason, version)
+            }
+
+            override fun onConnected() = Unit
+
+            override fun onDisconnected(reason: String?) {
+                // 断线只影响新鲜度，绝不清空画面 —— 重连后会收到全量快照自动收敛。
+                // 清空才是「成员一会儿一个一会儿两个」那类抖动的来源。
+                if (reason == "登录状态已失效") {
+                    forceReLogin("登录状态已失效，请重新登录")
+                }
+            }
+        })
+    }
+
+    private fun initNeriWatcher() {
+        neriWatcher = NeriRealtimeWatcher(
+            context = this,
+            onPlaybackUpdate = { songTitle, artist, coverUrl, durationMs, basePosMs, baseTimestampMs, playbackRate, isPlaying ->
+                onHostPlaybackUpdate(
+                    songTitle, artist, coverUrl, durationMs,
+                    basePosMs, playbackRate, isPlaying
+                )
+            },
+            onRoomClosed = {
+                // 只有房主会连 Neri，所以这里一定是「我自己的房间没了」
+                if (isHosting) {
+                    stopHosting(notifyServer = false)
+                    showTip("房主已结束放歌")
+                }
+            }
+        )
+    }
 
     private fun initViews() {
         ivUserAvatar = findViewById(R.id.ivUserAvatar)
@@ -223,91 +348,6 @@ class MainActivity : AppCompatActivity() {
         layoutMembersContainer = findViewById(R.id.layoutMembersContainer)
     }
 
-    private fun initProgressTracker() {
-        progressTracker = PlaybackProgressTracker(
-            scope = lifecycleScope,
-            onProgressTick = { ratio ->
-                pbPlayerProgress.progress = (ratio * 1000).toInt()
-            },
-            onSongFinished = {}
-        )
-    }
-
-    private fun initRealtimeWatcher() {
-        neriWatcher = NeriRealtimeWatcher(
-            context = this,
-            onPlaybackUpdate = { songTitle, artist, coverUrl, durationMs, basePosMs, baseTimestampMs, playbackRate, isPlaying ->
-                if (!songTitle.isNullOrBlank()) {
-                    layoutAudioPlayerCard.isVisible = true
-
-                    tvPlayerSongTitle.text = songTitle
-                    tvPlayerArtist.text = artist ?: "NeriPlayer"
-                    tvPlayerSongTitle.isSelected = true
-
-                    val isNewSong = (songTitle != liveSongTitle)
-
-                    liveSongTitle = songTitle
-                    liveArtist = artist
-                    liveCoverUrl = coverUrl
-                    liveDurationMs = durationMs
-                    liveBasePosMs = basePosMs
-                    liveIsPlaying = isPlaying
-
-                    if (!coverUrl.isNullOrEmpty()) {
-                        ivPlayerAlbumCover.load(coverUrl) {
-                            crossfade(true)
-                            placeholder(R.drawable.bg_avatar_gray)
-                            error(R.drawable.bg_avatar_gray)
-                            transformations(CircleCropTransformation())
-                        }
-                    } else {
-                        ivPlayerAlbumCover.setImageResource(R.drawable.bg_avatar_gray)
-                    }
-
-                    progressTracker.updateMetrics(
-                        durationMs = durationMs,
-                        basePositionMs = basePosMs,
-                        baseTimestampMs = baseTimestampMs,
-                        playbackRate = playbackRate,
-                        isPlaying = isPlaying
-                    )
-
-                    // ⚡ 房主切歌毫秒级主动同步服务器 Redis
-                    if (isHosting && isNewSong) {
-                        lifecycleScope.launch(Dispatchers.IO) {
-                            val fullSongName = if (!artist.isNullOrEmpty()) "$songTitle - $artist" else songTitle
-                            apiService.sendHeartbeat(
-                                username = sessionManager.getUsername(),
-                                currentSong = fullSongName,
-                                currentCover = coverUrl,
-                                durationMs = durationMs,
-                                basePositionMs = basePosMs,
-                                isPlaying = isPlaying
-                            )
-                        }
-                    }
-                } else {
-                    progressTracker.stop()
-                    layoutAudioPlayerCard.isVisible = false
-                    liveSongTitle = null
-                }
-            },
-            onRoomClosed = {
-                if (currentRoomInfo != null || currentDeepLink != null) {
-                    showTip("房主已结束放歌")
-                    currentRoomInfo = null
-                    currentDeepLink = null
-                    if (isHosting) {
-                        isHosting = false
-                        stopHeartbeat()
-                        sessionManager.clearHostingRoom()
-                    }
-                    updateRoomUi(false, null, null, null, null)
-                }
-            }
-        )
-    }
-
     @SuppressLint("SetJavaScriptEnabled")
     private fun initWebViewSettings() {
         webHexLoader.setBackgroundColor(0)
@@ -333,75 +373,11 @@ class MainActivity : AppCompatActivity() {
         return webView
     }
 
-    private fun switchAnimation(animType: Int) {
-        if (currentAnimType == animType) return
-        currentAnimType = animType
-
-        val htmlContent = when (animType) {
-            AnimationTemplates.ANIM_SPINNER -> AnimationTemplates.getDotSpinnerHtml()
-            AnimationTemplates.ANIM_HEX -> AnimationTemplates.getHexLoaderHtml()
-            else -> ""
-        }
-        webHexLoader.loadDataWithBaseURL(null, htmlContent, "text/html", "UTF-8", null)
-    }
-
-    private fun showLoadingState() {
-        switchAnimation(AnimationTemplates.ANIM_SPINNER)
-        tvHostMessage.isVisible = false
-        tvHostMessage.text = ""
-        layoutAudioPlayerCard.isVisible = false
-        ivHostAvatar.isVisible = false
-        btnJoin.isVisible = false
-        layoutHostSection.isVisible = false
-    }
-
-    private fun showMembersLoading() {
-        tvMemberCountBadge.isVisible = false
-        layoutMembersContainer.removeAllViews()
-
-        val loader = getOrCreateMembersLoader()
-        (loader.parent as? ViewGroup)?.removeView(loader)
-        loader.loadDataWithBaseURL(null, AnimationTemplates.getDotSpinnerHtml(), "text/html", "UTF-8", null)
-
-        val params = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dp2px(260)
-        ).apply {
-            gravity = Gravity.CENTER
-            topMargin = dp2px(40)
-        }
-        layoutMembersContainer.addView(loader, params)
-    }
-
-    private fun updateUserUi() {
-        if (sessionManager.isLoggedIn()) {
-            tvCurrentUserName.text = sessionManager.getUsername()
-            btnLogout.isVisible = false
-
-            val avatarUri = sessionManager.getAvatarUri()
-            if (!avatarUri.isNullOrEmpty()) {
-                ivUserAvatar.load(avatarUri) {
-                    crossfade(true)
-                    placeholder(R.drawable.bg_avatar_gray)
-                    error(R.drawable.bg_avatar_gray)
-                    transformations(CircleCropTransformation())
-                }
-            } else {
-                ivUserAvatar.setImageResource(R.drawable.bg_avatar_gray)
-            }
-        } else {
-            tvCurrentUserName.text = "未登录"
-            btnLogout.isVisible = true
-            btnLogout.text = "登录"
-            ivUserAvatar.setImageResource(R.drawable.bg_avatar_gray)
-        }
-    }
-
     private fun setupListeners() {
         tabMusic.setOnClickListener { switchTab(isMusicTab = true) }
         tabMembers.setOnClickListener {
             switchTab(isMusicTab = false)
-            fetchRegisteredMembers()
+            refreshMembersTab()
         }
 
         ivUserAvatar.setOnClickListener {
@@ -414,24 +390,7 @@ class MainActivity : AppCompatActivity() {
 
         btnLogout.setOnClickListener {
             if (sessionManager.isLoggedIn()) {
-                if (isHosting) {
-                    lifecycleScope.launch {
-                        apiService.broadcastRoom("stop", sessionManager.getUsername(), currentRoomInfo)
-                    }
-                }
-                sessionManager.clearSession()
-                sessionManager.clearHostingRoom()
-                isHosting = false
-                stopHeartbeat()
-                neriWatcher.stopWatching()
-                cachedMembers = null
-                lastFetchMembersTime = 0L
-                fetchMembersJob?.cancel()
-                liveSongTitle = null
-
-                updateUserUi()
-                updateRoomUi(false, null, null, null, null)
-                showTip("已退出登录")
+                logout()
             } else {
                 startActivitySafely("com.example.social_music.LoginActivity")
             }
@@ -451,7 +410,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnJoin.setOnClickListener {
-            val link = currentDeepLink
+            if (!requireLogin()) return@setOnClickListener
+
+            val link = snapshot?.room?.deepLink
             if (link.isNullOrEmpty()) {
                 showTip("当前无可用房间链接")
                 return@setOnClickListener
@@ -460,11 +421,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnPublishRoom.setOnClickListener {
-            if (!sessionManager.isLoggedIn()) {
-                showTip("请先登录")
-                return@setOnClickListener
-            }
-
+            if (!requireLogin()) return@setOnClickListener
             if (isPublishing) return@setOnClickListener
 
             val text = etInviteCode.text.toString().trim()
@@ -475,6 +432,847 @@ class MainActivity : AppCompatActivity() {
             }
 
             verifyAndStartHosting(roomInfo)
+        }
+    }
+
+    // ==========================================================
+    // 会话
+    // ==========================================================
+
+    private fun requireLogin(): Boolean {
+        if (sessionManager.isLoggedIn()) return true
+        showTip("请先登录")
+        startActivitySafely("com.example.social_music.LoginActivity")
+        return false
+    }
+
+    private fun logout() {
+        stopHosting(notifyServer = true)
+        sessionManager.clearSession()
+        realtime.disconnect()
+        resetSessionState()
+        wasLoggedIn = false
+        updateUserUi()
+        renderInitialState()
+        showTip("已退出登录")
+    }
+
+    private fun onLoggedIn() {
+        hostReviveCount = 0
+        resetSessionState()
+        renderInitialState()
+        bootstrap()
+    }
+
+    private fun onLoggedOut() {
+        stopHosting(notifyServer = true)
+        realtime.disconnect()
+        resetSessionState()
+        renderInitialState()
+    }
+
+    private fun forceReLogin(message: String) {
+        stopHosting(notifyServer = false)
+        sessionManager.clearSession()
+        realtime.disconnect()
+        resetSessionState()
+        wasLoggedIn = false
+        updateUserUi()
+        renderInitialState()
+        showTip(message)
+    }
+
+    /**
+     * 清掉所有跟上一次登录身份绑定的内存状态。
+     * 必须连在途请求一起取消 —— 否则退出登录后，一个还在飞的 fetchState
+     * 会回来把房间画面重新画到「未登录」界面上面。
+     */
+    private fun resetSessionState() {
+        bootstrapJob?.cancel()
+        bootstrapJob = null
+        rosterJob?.cancel()
+        rosterJob = null
+
+        roster.clear()
+        rosterLoaded = false
+        rosterError = null
+        lastRosterFetchAt = 0L
+
+        onlineQq = emptySet()
+        hostQq = null
+        lastVersion = 0L
+        snapshot = null
+        hasRenderedOnce = false
+        suppressRoomClosedUntil = 0L
+    }
+
+    /** 首屏：REST 快照 + 长连接。长连接握手时服务端也会立刻推一份全量快照。 */
+    private fun bootstrap() {
+        val token = sessionManager.getToken() ?: return
+
+        bootstrapJob?.cancel()
+        bootstrapJob = lifecycleScope.launch {
+            when (val outcome = api.fetchState(token)) {
+                is StateOutcome.Ok -> applySnapshot(outcome.snapshot)
+                StateOutcome.Unauthorized -> forceReLogin("登录状态已失效，请重新登录")
+                is StateOutcome.Failed -> {
+                    if (!hasRenderedOnce) renderUnavailableState()
+                }
+            }
+        }
+
+        refreshProfile()
+        connectRealtimeIfPossible()
+    }
+
+    /** JWT 里的昵称是签发时的快照，改过名字就是脏的，所以每次进前台都拉一次最新档案 */
+    private fun refreshProfile() {
+        val token = sessionManager.getToken() ?: return
+
+        lifecycleScope.launch {
+            when (val outcome = api.fetchProfile(token)) {
+                is ProfileOutcome.Ok -> {
+                    if (outcome.qq.isNotEmpty()) sessionManager.saveQq(outcome.qq)
+                    if (outcome.username.isNotEmpty()) sessionManager.saveUsername(outcome.username)
+                    if (outcome.avatarUrl.isNotEmpty()) sessionManager.saveAvatarUri(outcome.avatarUrl)
+                    updateUserUi()
+                    refreshMembersTab()
+                }
+                ProfileOutcome.Unauthorized -> forceReLogin("登录状态已失效，请重新登录")
+                is ProfileOutcome.Failed -> Unit
+            }
+        }
+    }
+
+    private fun connectRealtimeIfPossible() {
+        val token = sessionManager.getToken() ?: return
+        realtime.connect(token)
+    }
+
+    // ==========================================================
+    // 状态渲染（唯一入口）
+    // ==========================================================
+
+    private fun applySnapshot(incoming: RoomSnapshot) {
+        // 乱序到达的旧快照直接丢弃，绝不让它把新状态覆盖回去
+        if (incoming.version < lastVersion) return
+        lastVersion = incoming.version
+
+        snapshot = incoming
+        hasRenderedOnce = true
+
+        // 实时在线集合，花名册的角标全靠它
+        onlineQq = incoming.members.map { it.qq }.filter { it.isNotEmpty() }.toSet()
+        hostQq = incoming.room?.publisherQq
+            ?: incoming.members.firstOrNull { it.isHosting }?.qq
+
+        renderFromSnapshot()
+        refreshMembersTab()
+    }
+
+    private fun renderFromSnapshot() {
+        val snap = snapshot ?: return
+        if (isPublishing) return
+
+        // 顺序很重要：先按服务端的说法对齐房主身份，再决定进度条用哪个时基，最后才渲染。
+        // 反过来的话，「我掉线、别人接管」的那一帧会拿服务端时间戳去套本机时基，
+        // 进度条会整体偏移，要等到下一帧才被纠正。
+        reconcileHosting(snap.room)
+        if (!isHosting) {
+            progressTracker.updateServerTime(snap.serverTime)
+        }
+
+        renderRoom(snap.room)
+    }
+
+    /** 首屏加载动画只在「真的还没有任何数据」时出现，不再每次 onResume 都闪一下 */
+    private fun renderInitialState() {
+        if (!sessionManager.isLoggedIn()) {
+            renderLoggedOutState()
+            return
+        }
+        if (hasRenderedOnce) return
+
+        switchAnimation(AnimationTemplates.ANIM_SPINNER)
+        tvHostMessage.isVisible = false
+        tvHostMessage.text = ""
+        layoutAudioPlayerCard.isVisible = false
+        ivHostAvatar.isVisible = false
+        btnJoin.isVisible = false
+        layoutHostSection.isVisible = false
+    }
+
+    private fun renderLoggedOutState() {
+        switchAnimation(AnimationTemplates.ANIM_HEX)
+        tvHostMessage.isVisible = true
+        tvHostMessage.text = "登录后即可加入群友的房间"
+
+        ivHostAvatar.isVisible = false
+        btnJoin.isVisible = false
+        layoutHostSection.isVisible = false
+        layoutAudioPlayerCard.isVisible = false
+
+        progressTracker.reset()
+        pbPlayerProgress.progress = 0
+
+        renderMembersLoggedOut()
+    }
+
+    private fun renderUnavailableState() {
+        switchAnimation(AnimationTemplates.ANIM_HEX)
+        tvHostMessage.isVisible = true
+        tvHostMessage.text = "暂时连不上服务器"
+
+        ivHostAvatar.isVisible = false
+        btnJoin.isVisible = false
+        layoutHostSection.isVisible = false
+    }
+
+    private fun renderRoom(room: ActiveRoom?) {
+        switchAnimation(AnimationTemplates.ANIM_HEX)
+        tvHostMessage.isVisible = true
+
+        if (room == null) {
+            tvHostMessage.text = "空闲"
+            tvPlayerSongTitle.text = ""
+            tvPlayerArtist.text = ""
+            ivPlayerAlbumCover.setImageResource(R.drawable.bg_avatar_gray)
+
+            layoutAudioPlayerCard.isVisible = false
+            ivHostAvatar.isVisible = false
+            btnJoin.isVisible = false
+            layoutHostSection.isVisible = true
+
+            progressTracker.reset()
+            pbPlayerProgress.progress = 0
+            return
+        }
+
+        val meHosting = isMeHosting(room)
+        tvHostMessage.text = if (meHosting) "你正在放歌" else "${room.inviter ?: "群友"} 正在放歌"
+
+        renderPlayerCard(room, meHosting)
+
+        ivHostAvatar.isVisible = true
+        loadCircleImage(ivHostAvatar, room.hostAvatarUrl)
+
+        btnJoin.isVisible = !meHosting
+        layoutHostSection.isVisible = false
+    }
+
+    private fun renderPlayerCard(room: ActiveRoom, meHosting: Boolean) {
+        // 房主自己就是数据源，画面直接吃 Neri 回调。
+        // 否则服务器回声会把刚跳到的新进度又拽回上一个锚点，看起来就是「进度条慢半拍」。
+        if (meHosting && isHosting && liveSongTitle != null) return
+
+        val song = room.currentSong
+        if (song.isNullOrBlank()) {
+            layoutAudioPlayerCard.isVisible = false
+            progressTracker.reset()
+            pbPlayerProgress.progress = 0
+            return
+        }
+
+        layoutAudioPlayerCard.isVisible = true
+
+        val parts = song.split(" - ")
+        tvPlayerSongTitle.text = if (parts.size > 1) parts.dropLast(1).joinToString(" - ") else song
+        tvPlayerArtist.text = if (parts.size > 1) parts.last() else "NeriPlayer"
+        tvPlayerSongTitle.isSelected = true
+
+        loadCircleImage(ivPlayerAlbumCover, room.currentCover)
+
+        progressTracker.updateMetrics(
+            durationMs = room.durationMs,
+            basePositionMs = room.basePositionMs,
+            baseTimestampMs = room.baseTimestampMs,
+            playbackRate = room.playbackRate,
+            isPlaying = room.isPlaying
+        )
+    }
+
+    private fun currentRoom(): ActiveRoom? = snapshot?.room
+
+    private fun isMeHosting(room: ActiveRoom?): Boolean {
+        if (room == null || !sessionManager.isLoggedIn()) return false
+
+        val myQq = sessionManager.getQq()
+        if (myQq.isNotEmpty() && !room.publisherQq.isNullOrEmpty()) {
+            return myQq == room.publisherQq
+        }
+
+        // 老账号可能还没拿到 qq，退回昵称比对
+        val myName = sessionManager.getUsername()
+        return myName == room.publisher || myName == room.inviter
+    }
+
+    // ==========================================================
+    // 成员列表
+    // ==========================================================
+
+    private fun refreshMembersTab() {
+        if (!layoutMembersTabContent.isVisible) return
+
+        if (!sessionManager.isLoggedIn()) {
+            renderMembersLoggedOut()
+            return
+        }
+
+        fetchRosterIfStale()
+        renderMembers()
+    }
+
+    private fun renderMembersLoggedOut() {
+        tvMemberCountBadge.isVisible = false
+        layoutMembersContainer.removeAllViews()
+        layoutMembersContainer.addView(buildMembersHint("登录后查看成员名单"))
+    }
+
+    private fun fetchRosterIfStale() {
+        val token = sessionManager.getToken() ?: return
+
+        val now = System.currentTimeMillis()
+        if (now - lastRosterFetchAt < ROSTER_CACHE_MS) return
+        if (rosterJob?.isActive == true) return
+
+        lastRosterFetchAt = now
+        rosterJob = lifecycleScope.launch {
+            api.fetchRoster(token)
+                .onSuccess { list ->
+                    roster.clear()
+                    roster.addAll(list)
+                    rosterLoaded = true
+                    rosterError = null
+                    renderMembers()
+                }
+                .onFailure { error ->
+                    // 拉不到就沿用上一次的名单，绝不塌缩成一份短列表 ——
+                    // 那正是「一会儿一个人一会儿两个人」的老毛病。
+                    Log.w(TAG, "花名册拉取失败，沿用上次结果: ${error.message}")
+                    rosterError = error.message
+                    // 失败不占用缓存窗口，下次进成员页立刻重试
+                    lastRosterFetchAt = 0L
+                    if (!rosterLoaded) renderMembers()
+                }
+        }
+    }
+
+    /**
+     * 名单 = 全部注册成员（稳定，不随在线状态增删），
+     * 在线 / 在放歌 / 我 都是挂在行上的角标。
+     */
+    private fun renderMembers() {
+        if (!rosterLoaded) {
+            if (rosterError != null) {
+                // 一直转圈是最糟的失败方式：拉不到就明说，重进本页会自动重试
+                tvMemberCountBadge.isVisible = false
+                layoutMembersContainer.removeAllViews()
+                layoutMembersContainer.addView(buildMembersHint("成员列表加载失败，重进本页可重试"))
+            } else {
+                showMembersLoading()
+            }
+            return
+        }
+
+        val members = displayRoster()
+        val onlineCount = members.count { isOnlineNow(it.qq) }
+
+        tvMemberCountBadge.isVisible = true
+        tvMemberCountBadge.text = "${members.size} 位已认证 · $onlineCount 在线"
+        layoutMembersContainer.removeAllViews()
+
+        if (members.isEmpty()) {
+            layoutMembersContainer.addView(buildMembersHint("暂无注册成员"))
+            return
+        }
+
+        val myQq = sessionManager.getQq()
+        val myName = sessionManager.getUsername()
+
+        for (member in members) {
+            val itemView = layoutInflater.inflate(R.layout.item_user_member, layoutMembersContainer, false)
+            val ivAvatar = itemView.findViewById<ShapeableImageView>(R.id.ivMemberAvatar)
+            val tvName = itemView.findViewById<TextView>(R.id.tvMemberName)
+            val tvMeBadge = itemView.findViewById<TextView>(R.id.tvMeBadge)
+            val tvOnlineBadge = itemView.findViewById<TextView>(R.id.tvOnlineBadge)
+            val tvHostingBadge = itemView.findViewById<TextView>(R.id.tvHostingBadge)
+
+            tvName.text = member.username
+
+            val isMe = if (myQq.isNotEmpty() && member.qq.isNotEmpty()) {
+                member.qq == myQq
+            } else {
+                member.username == myName
+            }
+            tvMeBadge.isVisible = isMe
+            tvOnlineBadge.isVisible = isOnlineNow(member.qq)
+            tvHostingBadge.isVisible = isHostingNow(member)
+
+            loadCircleImage(ivAvatar, member.avatarUrl)
+            layoutMembersContainer.addView(itemView)
+        }
+    }
+
+    /** 花名册为准；万一自己刚注册还没落库，先把自己补在最前面（只增不减） */
+    private fun displayRoster(): List<MemberInfo> {
+        val myQq = sessionManager.getQq()
+        if (myQq.isEmpty() || roster.any { it.qq == myQq }) return roster
+
+        return buildList {
+            add(
+                MemberInfo(
+                    qq = myQq,
+                    username = sessionManager.getUsername(),
+                    avatarUrl = sessionManager.getAvatarUri().orEmpty(),
+                    isHosting = false,
+                    isOnline = true
+                )
+            )
+            addAll(roster)
+        }
+    }
+
+    private fun isOnlineNow(qq: String): Boolean = qq.isNotEmpty() && onlineQq.contains(qq)
+
+    private fun isHostingNow(member: MemberInfo): Boolean {
+        val qq = hostQq
+        return if (qq != null) member.qq == qq else member.isHosting
+    }
+
+    private fun showMembersLoading() {
+        tvMemberCountBadge.isVisible = false
+        layoutMembersContainer.removeAllViews()
+
+        val loader = getOrCreateMembersLoader()
+        (loader.parent as? ViewGroup)?.removeView(loader)
+        loader.loadDataWithBaseURL(
+            null,
+            AnimationTemplates.getDotSpinnerHtml(),
+            "text/html",
+            "UTF-8",
+            null
+        )
+
+        val params = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp2px(260)
+        ).apply {
+            gravity = Gravity.CENTER
+            topMargin = dp2px(40)
+        }
+        layoutMembersContainer.addView(loader, params)
+    }
+
+    private fun buildMembersHint(text: String): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = 14f
+            setTextColor(0xFF94A3B8.toInt())
+            gravity = Gravity.CENTER
+            setPadding(0, dp2px(70), 0, dp2px(70))
+        }
+    }
+
+    // ==========================================================
+    // 房主：状态上报
+    // ==========================================================
+
+    private fun onHostPlaybackUpdate(
+        songTitle: String?,
+        artist: String?,
+        coverUrl: String?,
+        durationMs: Long,
+        basePosMs: Long,
+        playbackRate: Double,
+        isPlaying: Boolean
+    ) {
+        if (!isHosting) return
+
+        if (songTitle.isNullOrBlank()) {
+            liveSongTitle = null
+            liveArtist = null
+            liveCoverUrl = null
+            liveDurationMs = 0L
+            liveBasePosMs = 0L
+            liveAnchorAtMs = 0L
+            liveIsPlaying = false
+
+            layoutAudioPlayerCard.isVisible = false
+            progressTracker.reset()
+            pbPlayerProgress.progress = 0
+            return
+        }
+
+        liveSongTitle = songTitle
+        liveArtist = artist
+        liveCoverUrl = coverUrl
+        liveDurationMs = durationMs
+        liveBasePosMs = basePosMs
+        liveAnchorAtMs = System.currentTimeMillis()
+        liveIsPlaying = isPlaying
+
+        // 房主自己的画面直接吃 Neri 回调，零延迟
+        layoutAudioPlayerCard.isVisible = true
+        tvPlayerSongTitle.text = songTitle
+        tvPlayerArtist.text = artist ?: "NeriPlayer"
+        tvPlayerSongTitle.isSelected = true
+        loadCircleImage(ivPlayerAlbumCover, coverUrl)
+
+        progressTracker.useLocalClock()
+        progressTracker.updateMetrics(
+            durationMs = durationMs,
+            basePositionMs = basePosMs,
+            baseTimestampMs = liveAnchorAtMs,
+            playbackRate = playbackRate,
+            isPlaying = isPlaying
+        )
+
+        pushHostState(includePlayback = true)
+    }
+
+    /** 房主本地的实时播放位置：锚点 + 已经过去的时间，保证上报给服务器的位置单调递增 */
+    private fun currentHostPositionMs(): Long {
+        if (!liveIsPlaying) return liveBasePosMs
+        val elapsed = System.currentTimeMillis() - liveAnchorAtMs
+        val position = liveBasePosMs + elapsed
+        return if (liveDurationMs > 0) position.coerceAtMost(liveDurationMs) else position
+    }
+
+    private fun pushHostState(includePlayback: Boolean) {
+        val token = sessionManager.getToken() ?: return
+        if (!isHosting) return
+
+        val title = liveSongTitle
+        val playback = if (includePlayback && !title.isNullOrEmpty()) {
+            PlaybackPayload(
+                currentSong = if (!liveArtist.isNullOrEmpty()) "$title - $liveArtist" else title,
+                currentCover = liveCoverUrl,
+                durationMs = liveDurationMs,
+                basePositionMs = currentHostPositionMs(),
+                isPlaying = liveIsPlaying
+            )
+        } else {
+            null
+        }
+
+        lifecycleScope.launch {
+            when (val outcome = api.hostPushState(token, playback)) {
+                PushOutcome.Ok -> touchHostingRecord()
+                PushOutcome.RoomLost -> {
+                    // 服务端已经没有我的房间了，交给下一轮 reconcile 去重挂
+                    Log.w(TAG, "服务端已无本房间，等待重新挂载")
+                }
+                PushOutcome.Unauthorized -> forceReLogin("登录状态已失效，请重新登录")
+                is PushOutcome.Failed -> Unit
+            }
+        }
+    }
+
+    private fun startHostKeepalive() {
+        if (hostKeepaliveJob?.isActive == true) return
+
+        hostKeepaliveJob = lifecycleScope.launch {
+            while (isActive && isHosting) {
+                delay(HOST_KEEPALIVE_INTERVAL_MS)
+                if (isHosting) pushHostState(includePlayback = true)
+            }
+        }
+    }
+
+    /**
+     * 把本地房主身份和服务端状态对齐：
+     *  - 服务端有房间、房主是我 → 需要时把房主身份和 Neri 连接接回来
+     *  - 服务端有房间、房主是别人 → 放弃本地房主身份
+     *  - 服务端没房间、本地还留着房主记录 → 重新挂上去
+     *    （房主 App 被系统杀掉时收不到关闭通知，只能靠这条路径恢复）
+     */
+    private fun reconcileHosting(room: ActiveRoom?) {
+        // isRevivingHost 是关键：App 重启后第一波会连着来好几条「无房间」快照
+        // （bootstrap 的 REST 快照 + 长连接握手的广播 + 其他人的连接抖动）。
+        // 没有这个在途标记，每一条都会白白扣掉一次重试额度，
+        // 三次之后就误判成「房间已解散」，把正在恢复的房间拆掉。
+        if (isPublishing || isRevivingHost) return
+        val token = sessionManager.getToken() ?: return
+
+        if (room != null) {
+            if (isMeHosting(room)) {
+                adoptHostingIfNeeded()
+            } else if (isHosting) {
+                Log.i(TAG, "房间已被他人接管，放弃本地房主身份")
+                stopHosting(notifyServer = false)
+            }
+            return
+        }
+
+        // 服务端没有房间。房主记录只在「主动关房」或「确认解散」时才会被清掉，
+        // 所以它还在就说明上次多半是被系统杀掉的，值得重挂。
+        val persisted = currentRoomInfo ?: restoreHostingRoom()
+        if (persisted == null) {
+            if (isHosting) stopHosting(notifyServer = false)
+            return
+        }
+
+        if (hostReviveCount >= MAX_HOST_REVIVE) {
+            stopHosting(notifyServer = false)
+            showTip("房间已解散")
+            return
+        }
+
+        hostReviveCount++
+        isRevivingHost = true
+        Log.i(TAG, "服务端无房间，重新挂载（第 $hostReviveCount 次）")
+
+        lifecycleScope.launch {
+            try {
+                when (val outcome = api.hostStart(token, persisted)) {
+                    is StartOutcome.Ok -> {
+                        currentRoomInfo = persisted
+                        persistHostingRoom(persisted)
+                        adoptHostingIfNeeded()
+                    }
+                    is StartOutcome.Conflict -> {
+                        stopHosting(notifyServer = false)
+                        showTip(outcome.message)
+                    }
+                    StartOutcome.Unauthorized -> forceReLogin("登录状态已失效，请重新登录")
+                    is StartOutcome.Failed -> {
+                        if (hostReviveCount >= MAX_HOST_REVIVE) {
+                            stopHosting(notifyServer = false)
+                            showTip("房间已解散")
+                        }
+                    }
+                }
+            } finally {
+                isRevivingHost = false
+            }
+        }
+    }
+
+    /** 服务端确认我是房主，但本地还没在放歌 —— 把 Neri 长连接和保活循环接回来 */
+    private fun adoptHostingIfNeeded() {
+        if (isHosting) return
+
+        val persisted = currentRoomInfo ?: restoreHostingRoom() ?: return
+        Log.i(TAG, "接管回房主身份 roomId=${persisted.roomId}")
+
+        isHosting = true
+        currentRoomInfo = persisted
+        startNeriWatcher(persisted)
+        startHostKeepalive()
+    }
+
+    private fun handleServerRoomClosed(reason: String, version: Long) {
+        // 采纳关房的版本号：否则一条迟到的 REST 快照会带着相同的版本号
+        // 通过排序检查，把刚关掉的房间又画回来。
+        if (version > lastVersion) lastVersion = version
+
+        val wasHosting = isHosting
+        stopHosting(notifyServer = false)
+
+        snapshot = snapshot?.copy(room = null)
+        // 注意：不清理 onlineQq —— 关房不影响谁还连着，成员仍然是在线的
+        hostQq = null
+
+        if (!isPublishing) renderRoom(null)
+        refreshMembersTab()
+
+        if (System.currentTimeMillis() < suppressRoomClosedUntil) return
+
+        when {
+            wasHosting && reason == "timeout" -> showTip("房间长时间无响应，已自动关闭")
+            wasHosting -> Unit
+            else -> showTip("房主已结束放歌")
+        }
+    }
+
+    // ==========================================================
+    // 房主：开播 / 关播
+    // ==========================================================
+
+    private fun verifyAndStartHosting(info: RoomInfo) {
+        val roomId = info.roomId?.trim()
+        val secret = info.secret?.trim()
+
+        if (roomId.isNullOrEmpty() || !roomId.matches(Regex("^[a-zA-Z0-9]{6}$")) || secret.isNullOrEmpty()) {
+            showTip("口令格式错误：未解析到合法的6位房间号或密钥！")
+            return
+        }
+        if (isPublishing) return
+
+        val token = sessionManager.getToken()
+        if (token.isNullOrEmpty()) {
+            showTip("请先登录")
+            return
+        }
+
+        isPublishing = true
+        setPublishControlsEnabled(false, "开启中...")
+
+        lifecycleScope.launch {
+            val outcome = api.hostStart(token, info)
+            isPublishing = false
+            setPublishControlsEnabled(true, "开启")
+
+            when (outcome) {
+                is StartOutcome.Ok -> onHostingStarted(info, outcome.room)
+                is StartOutcome.Conflict -> {
+                    showTip(outcome.message)
+                    renderFromSnapshot()
+                }
+                StartOutcome.Unauthorized -> forceReLogin("登录状态已失效，请重新登录")
+                is StartOutcome.Failed -> {
+                    showTip(outcome.message ?: "开启失败")
+                    renderFromSnapshot()
+                }
+            }
+        }
+    }
+
+    private fun onHostingStarted(info: RoomInfo, room: ActiveRoom?) {
+        hostReviveCount = 0
+        isHosting = true
+        currentRoomInfo = info
+
+        persistHostingRoom(info)
+        etInviteCode.setText("")
+
+        startNeriWatcher(info)
+        startHostKeepalive()
+
+        room?.let { renderRoom(it) }
+        showTip("房间上线成功！")
+    }
+
+    private fun stopHosting(notifyServer: Boolean) {
+        val wasHosting = isHosting
+
+        isHosting = false
+        hostReviveCount = 0
+        hostKeepaliveJob?.cancel()
+        hostKeepaliveJob = null
+        neriWatcher.stopWatching()
+        currentRoomInfo = null
+        sessionManager.clearHostingRoom()
+
+        liveSongTitle = null
+        liveArtist = null
+        liveCoverUrl = null
+        liveDurationMs = 0L
+        liveBasePosMs = 0L
+        liveAnchorAtMs = 0L
+        liveIsPlaying = false
+
+        if (wasHosting && notifyServer) {
+            suppressRoomClosedUntil = System.currentTimeMillis() + ROOM_CLOSED_SUPPRESS_MS
+            val token = sessionManager.getToken()
+            if (token != null) {
+                lifecycleScope.launch { api.hostStop(token) }
+            }
+        }
+    }
+
+    private fun startNeriWatcher(info: RoomInfo) {
+        val roomId = info.roomId ?: return
+        val secret = info.secret ?: return
+        if (roomId.isEmpty() || secret.isEmpty()) return
+
+        neriWatcher.startWatching(
+            info.serverUrl ?: ApiConfig.DEFAULT_NERI_SERVER,
+            roomId,
+            secret,
+            sessionManager.getUsername()
+        )
+    }
+
+    private fun setPublishControlsEnabled(enabled: Boolean, text: String) {
+        btnPublishRoom.isEnabled = enabled
+        btnPublishRoom.text = text
+        btnPasteInvite.isEnabled = enabled
+        etInviteCode.isEnabled = enabled
+    }
+
+    // ==========================================================
+    // 房主身份持久化
+    // ==========================================================
+
+    private fun persistHostingRoom(info: RoomInfo) {
+        val json = JSONObject().apply {
+            put("ownerQq", sessionManager.getQq())
+            put("owner", sessionManager.getUsername())
+            put("roomId", info.roomId ?: "")
+            put("secret", info.secret ?: "")
+            put("deepLink", info.rawUri)
+            put("serverUrl", info.serverUrl ?: ApiConfig.DEFAULT_NERI_SERVER)
+            put("inviter", info.inviter ?: "")
+            put("savedAt", System.currentTimeMillis())
+        }
+        lastRecordRefreshAt = System.currentTimeMillis()
+        sessionManager.saveHostingRoom(json.toString())
+    }
+
+    /** 房主还在正常放歌时定期把记录的时间戳续上，否则它会在 30 分钟后过期 */
+    private fun touchHostingRecord() {
+        val now = System.currentTimeMillis()
+        if (now - lastRecordRefreshAt < RECORD_REFRESH_INTERVAL_MS) return
+        currentRoomInfo?.let { persistHostingRoom(it) }
+    }
+
+    private fun restoreHostingRoom(): RoomInfo? {
+        val raw = sessionManager.getHostingRoom() ?: return null
+
+        return try {
+            val json = JSONObject(raw)
+
+            // 换了账号登录，旧的房主身份必须作废。
+            // 用 qq 而不是昵称比对 —— 昵称是可以随时改的，改了不该把房间丢掉。
+            val ownerQq = json.optString("ownerQq", "")
+            val myQq = sessionManager.getQq()
+            if (ownerQq.isNotEmpty() && myQq.isNotEmpty() && ownerQq != myQq) {
+                sessionManager.clearHostingRoom()
+                return null
+            }
+
+            // 过期记录直接作废，别在第二天打开 App 时凭空拉起一个僵尸房间
+            val savedAt = json.optLong("savedAt", 0L)
+            if (savedAt > 0 && System.currentTimeMillis() - savedAt > HOST_RECORD_MAX_AGE_MS) {
+                Log.i(TAG, "房主记录已过期，作废")
+                sessionManager.clearHostingRoom()
+                return null
+            }
+
+            val roomId = json.optString("roomId", "")
+            if (roomId.isEmpty()) return null
+
+            RoomInfo(
+                rawUri = json.optString("deepLink", ""),
+                roomId = roomId,
+                inviter = json.optString("inviter", "").ifEmpty { null },
+                secret = json.optString("secret", "").ifEmpty { null },
+                serverUrl = json.optString("serverUrl", "").ifEmpty { null }
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    // ==========================================================
+    // 视图工具
+    // ==========================================================
+
+    private fun showTip(message: String) = tipManager.showTip(message)
+
+    private fun dp2px(dp: Int): Int = (dp * resources.displayMetrics.density + 0.5f).toInt()
+
+    private fun loadCircleImage(view: ShapeableImageView, url: String?) {
+        if (url.isNullOrEmpty()) {
+            view.setImageResource(R.drawable.bg_avatar_gray)
+            return
+        }
+        view.load(url) {
+            crossfade(true)
+            placeholder(R.drawable.bg_avatar_gray)
+            error(R.drawable.bg_avatar_gray)
+            transformations(CircleCropTransformation())
         }
     }
 
@@ -489,6 +1287,20 @@ class MainActivity : AppCompatActivity() {
             tvTabMembers.setTextColor(0xFF0F172A.toInt())
         }
     }
+
+    private fun switchAnimation(animType: Int) {
+        if (currentAnimType == animType) return
+        currentAnimType = animType
+
+        val htmlContent = when (animType) {
+            AnimationTemplates.ANIM_SPINNER -> AnimationTemplates.getDotSpinnerHtml()
+            AnimationTemplates.ANIM_HEX -> AnimationTemplates.getHexLoaderHtml()
+            else -> ""
+        }
+        webHexLoader.loadDataWithBaseURL(null, htmlContent, "text/html", "UTF-8", null)
+    }
+
+    private var currentAnimType = AnimationTemplates.ANIM_NONE
 
     private fun startActivitySafely(className: String) {
         try {
@@ -506,526 +1318,16 @@ class MainActivity : AppCompatActivity() {
             showTip("未找到 NeriPlayer，请确认已安装！")
         }
     }
-
-    private fun fetchRegisteredMembers(forceRefresh: Boolean = false) {
-        val now = System.currentTimeMillis()
-
-        if (!cachedMembers.isNullOrEmpty()) {
-            renderMembersList(cachedMembers!!)
-            if (!forceRefresh && (now - lastFetchMembersTime < 5000L)) {
-                return
-            }
+    private fun updateUserUi() {
+        if (sessionManager.isLoggedIn()) {
+            tvCurrentUserName.text = sessionManager.getUsername()
+            btnLogout.isVisible = false
+            loadCircleImage(ivUserAvatar, sessionManager.getAvatarUri())
         } else {
-            showMembersLoading()
-        }
-
-        fetchMembersJob?.cancel()
-        fetchMembersJob = lifecycleScope.launch {
-            try {
-                val token = sessionManager.getToken()
-                val result = apiService.fetchMemberList(token)
-
-                result.onSuccess { list ->
-                    val memberList = list.toMutableList()
-
-                    if (sessionManager.isLoggedIn()) {
-                        val myName = sessionManager.getUsername()
-                        if (memberList.none { it.username.equals(myName, ignoreCase = true) }) {
-                            memberList.add(
-                                0,
-                                RegisteredMember(
-                                    username = myName,
-                                    avatarUrl = sessionManager.getAvatarUri().orEmpty(),
-                                    isHosting = isHosting
-                                )
-                            )
-                        }
-                    }
-
-                    cachedMembers = memberList
-                    lastFetchMembersTime = System.currentTimeMillis()
-                    renderMembersList(memberList)
-                }.onFailure { error ->
-                    Log.w(TAG, "拉取成员失败: ${error.message}")
-                    if (cachedMembers.isNullOrEmpty()) {
-                        if (sessionManager.isLoggedIn()) {
-                            renderMembersList(
-                                listOf(
-                                    RegisteredMember(
-                                        username = sessionManager.getUsername(),
-                                        avatarUrl = sessionManager.getAvatarUri().orEmpty(),
-                                        isHosting = isHosting
-                                    )
-                                )
-                            )
-                        } else {
-                            renderMembersList(emptyList())
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                if (e is CancellationException) return@launch
-                Log.e(TAG, "拉取成员异常", e)
-            }
-        }
-    }
-
-    @SuppressLint("SetTextI18n")
-    private fun renderMembersList(members: List<RegisteredMember>) {
-        tvMemberCountBadge.isVisible = true
-        tvMemberCountBadge.text = "${members.size} 位已认证"
-        layoutMembersContainer.removeAllViews()
-
-        val myUsername = sessionManager.getUsername()
-
-        for (member in members) {
-            val itemView = layoutInflater.inflate(R.layout.item_user_member, layoutMembersContainer, false)
-            val ivAvatar = itemView.findViewById<ShapeableImageView>(R.id.ivMemberAvatar)
-            val tvName = itemView.findViewById<TextView>(R.id.tvMemberName)
-            val tvMeBadge = itemView.findViewById<TextView>(R.id.tvMeBadge)
-            val tvHostingBadge = itemView.findViewById<TextView>(R.id.tvHostingBadge)
-
-            tvName.text = member.username
-            tvMeBadge.isVisible = sessionManager.isLoggedIn() && member.username == myUsername
-            tvHostingBadge.isVisible = member.isHosting
-
-            if (member.avatarUrl.isNotEmpty()) {
-                ivAvatar.load(member.avatarUrl) {
-                    crossfade(true)
-                    placeholder(R.drawable.bg_avatar_gray)
-                    error(R.drawable.bg_avatar_gray)
-                    transformations(CircleCropTransformation())
-                }
-            } else {
-                ivAvatar.setImageResource(R.drawable.bg_avatar_gray)
-            }
-            layoutMembersContainer.addView(itemView)
-        }
-    }
-
-    private fun persistHostingRoom(info: RoomInfo) {
-        val json = JSONObject().apply {
-            put("owner", sessionManager.getUsername())
-            put("roomId", info.roomId ?: "")
-            put("secret", info.secret ?: "")
-            put("deepLink", info.rawUri)
-            put("serverUrl", info.serverUrl ?: RoomApiService.DEFAULT_NERI_SERVER)
-            put("inviter", info.inviter ?: "")
-            put("currentSong", info.currentSong ?: "")
-            put("currentCover", info.currentCover ?: "")
-        }
-        sessionManager.saveHostingRoom(json.toString())
-    }
-
-    private fun restoreHostingRoom(): RoomInfo? {
-        val raw = sessionManager.getHostingRoom() ?: return null
-        return try {
-            val json = JSONObject(raw)
-            val owner = json.optString("owner", "")
-            if (owner.isNotEmpty() && owner != sessionManager.getUsername()) {
-                sessionManager.clearHostingRoom()
-                return null
-            }
-
-            val roomId = json.optString("roomId", "")
-            if (roomId.isEmpty()) return null
-
-            RoomInfo(
-                rawUri = json.optString("deepLink", ""),
-                roomId = roomId,
-                inviter = json.optString("inviter", "").ifEmpty { null },
-                secret = json.optString("secret", "").ifEmpty { null },
-                serverUrl = json.optString("serverUrl", "").ifEmpty { null },
-                currentSong = json.optString("currentSong", "").ifEmpty { null },
-                currentCover = json.optString("currentCover", "").ifEmpty { null }
-            )
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun restoreHostingStateIfAny() {
-        if (isHosting) return
-        val restored = restoreHostingRoom() ?: return
-        Log.i(TAG, "恢复房主身份 roomId=${restored.roomId}")
-        currentRoomInfo = restored
-        isHosting = true
-        startHeartbeat()
-    }
-
-    private fun ensureRoomUiVisible(data: RoomApiService.StatusResult) {
-        switchAnimation(AnimationTemplates.ANIM_HEX)
-        tvHostMessage.isVisible = true
-
-        val myUsername = sessionManager.getUsername()
-        val isMe = sessionManager.isLoggedIn() && (myUsername == data.publisher || myUsername == data.inviter)
-        tvHostMessage.text = if (isMe) "你正在放歌" else "${data.inviter ?: "群友"} 正在放歌"
-
-        ivHostAvatar.isVisible = true
-        if (!data.hostAvatarUrl.isNullOrEmpty()) {
-            ivHostAvatar.load(data.hostAvatarUrl) {
-                crossfade(true)
-                placeholder(R.drawable.bg_avatar_gray)
-                error(R.drawable.bg_avatar_gray)
-                transformations(CircleCropTransformation())
-            }
-        } else {
-            ivHostAvatar.setImageResource(R.drawable.bg_avatar_gray)
-        }
-
-        btnJoin.isVisible = !isMe
-        layoutHostSection.isVisible = false
-
-        if (!layoutAudioPlayerCard.isVisible && !data.currentSong.isNullOrBlank()) {
-            applyRoomData(data)
-        }
-    }
-
-    private fun checkAndProbeRoomOnEntry() {
-        initProbeJob?.cancel()
-        roomMissCount = 0
-        initProbeJob = lifecycleScope.launch {
-            val result = apiService.getRoomStatus()
-            result.onSuccess { data ->
-                if (data.exists && !data.deepLink.isNullOrEmpty()) {
-                    val info = NeriDeepLinkHelper.parseInvitation(data.deepLink)?.copy(
-                        currentSong = data.currentSong,
-                        currentCover = data.currentCover
-                    )
-                    val isNewRoom = currentRoomInfo == null || currentRoomInfo?.roomId != info?.roomId
-
-                    val myUsername = sessionManager.getUsername()
-                    val isMe = sessionManager.isLoggedIn() && (myUsername == data.publisher || myUsername == data.inviter)
-
-                    if (isMe && info != null) {
-                        isHosting = true
-                        startHeartbeat()
-                    }
-
-                    currentRoomInfo = info
-
-                    if (isNewRoom) {
-                        applyRoomData(data)
-                    } else {
-                        ensureRoomUiVisible(data)
-                        info?.let {
-                            val serverUrl = it.serverUrl ?: RoomApiService.DEFAULT_NERI_SERVER
-                            if (!it.roomId.isNullOrEmpty() && !it.secret.isNullOrEmpty()) {
-                                neriWatcher.startWatching(serverUrl, it.roomId, it.secret, sessionManager.getUsername())
-                            }
-                        }
-                    }
-                } else {
-                    val info = currentRoomInfo ?: restoreHostingRoom()
-                    if (info != null) {
-                        currentRoomInfo = info
-                        isHosting = true
-                        startHeartbeat()
-                        executeBroadcastAction(info, action = "start", isResume = true)
-                    } else {
-                        isHosting = false
-                        stopHeartbeat()
-                        updateRoomUi(false, null, null, null, null)
-                    }
-                }
-                startPollingRoomStatus()
-            }.onFailure {
-                if (!isHosting) {
-                    updateRoomUi(false, null, null, null, null)
-                }
-                startPollingRoomStatus()
-            }
-        }
-    }
-
-    private fun applyRoomData(data: RoomApiService.StatusResult) {
-        updateRoomUi(
-            exists = true,
-            inviter = data.inviter,
-            publisher = data.publisher,
-            hostAvatarUrl = data.hostAvatarUrl,
-            deepLink = data.deepLink,
-            currentSong = data.currentSong,
-            currentCover = data.currentCover,
-            durationMs = data.durationMs,
-            basePositionMs = data.basePositionMs,
-            baseTimestampMs = data.baseTimestampMs,
-            playbackRate = data.playbackRate,
-            isPlaying = data.isPlaying
-        )
-
-        val info = currentRoomInfo
-        if (data.exists && info != null && !info.roomId.isNullOrEmpty() && !info.secret.isNullOrEmpty()) {
-            val serverUrl = info.serverUrl ?: RoomApiService.DEFAULT_NERI_SERVER
-            neriWatcher.startWatching(serverUrl, info.roomId, info.secret, sessionManager.getUsername())
-        }
-    }
-
-    private fun updateRoomUi(
-        exists: Boolean,
-        inviter: String?,
-        publisher: String?,
-        hostAvatarUrl: String?,
-        deepLink: String?,
-        currentSong: String? = null,
-        currentCover: String? = null,
-        durationMs: Long = 0L,
-        basePositionMs: Long = 0L,
-        baseTimestampMs: Long = 0L,
-        playbackRate: Double = 1.0,
-        isPlaying: Boolean = true
-    ) {
-        if (!exists && isPublishing) return
-
-        switchAnimation(AnimationTemplates.ANIM_HEX)
-        tvHostMessage.isVisible = true
-
-        if (!exists) {
-            neriWatcher.stopWatching()
-            currentDeepLink = null
-            currentRoomInfo = null
-            isHosting = false
-            stopHeartbeat()
-            progressTracker.stop()
-
-            tvHostMessage.text = "空闲"
-            layoutAudioPlayerCard.isVisible = false
-            ivHostAvatar.isVisible = false
-            btnJoin.isVisible = false
-            layoutHostSection.isVisible = true
-        } else {
-            currentDeepLink = deepLink
-            val myUsername = sessionManager.getUsername()
-            val isMe = sessionManager.isLoggedIn() && (myUsername == publisher || myUsername == inviter)
-
-            tvHostMessage.text = if (isMe) "你正在放歌" else "${inviter ?: "群友"} 正在放歌"
-
-            if (!currentSong.isNullOrBlank()) {
-                layoutAudioPlayerCard.isVisible = true
-
-                val parts = currentSong.split(" - ")
-                val title = if (parts.size > 1) parts.dropLast(1).joinToString(" - ") else currentSong
-                val artist = if (parts.size > 1) parts.last() else "NeriPlayer"
-
-                tvPlayerSongTitle.text = title
-                tvPlayerArtist.text = artist
-                tvPlayerSongTitle.isSelected = true
-
-                if (!currentCover.isNullOrEmpty()) {
-                    ivPlayerAlbumCover.load(currentCover) {
-                        crossfade(true)
-                        placeholder(R.drawable.bg_avatar_gray)
-                        error(R.drawable.bg_avatar_gray)
-                        transformations(CircleCropTransformation())
-                    }
-                } else {
-                    ivPlayerAlbumCover.setImageResource(R.drawable.bg_avatar_gray)
-                }
-
-                progressTracker.updateMetrics(
-                    durationMs = durationMs,
-                    basePositionMs = basePositionMs,
-                    baseTimestampMs = baseTimestampMs,
-                    playbackRate = playbackRate,
-                    isPlaying = isPlaying
-                )
-            } else {
-                progressTracker.stop()
-                layoutAudioPlayerCard.isVisible = false
-            }
-
-            ivHostAvatar.isVisible = true
-            if (!hostAvatarUrl.isNullOrEmpty()) {
-                ivHostAvatar.load(hostAvatarUrl) {
-                    crossfade(true)
-                    placeholder(R.drawable.bg_avatar_gray)
-                    error(R.drawable.bg_avatar_gray)
-                    transformations(CircleCropTransformation())
-                }
-            } else {
-                ivHostAvatar.setImageResource(R.drawable.bg_avatar_gray)
-            }
-
-            btnJoin.isVisible = !isMe
-            layoutHostSection.isVisible = false
-        }
-    }
-
-    private fun verifyAndStartHosting(info: RoomInfo) {
-        val roomId = info.roomId?.trim()
-        val secret = info.secret?.trim()
-
-        if (roomId.isNullOrEmpty() || !roomId.matches(Regex("^[a-zA-Z0-9]{6}$")) || secret.isNullOrEmpty()) {
-            showTip("口令格式错误：未解析到合法的6位房间号或密钥！")
-            return
-        }
-
-        isPublishing = true
-        btnPublishRoom.isEnabled = false
-        btnPublishRoom.text = "开启中..."
-        btnPasteInvite.isEnabled = false
-        etInviteCode.isEnabled = false
-
-        executeBroadcastAction(info, action = "start")
-    }
-
-    private fun startHeartbeat() {
-        if (heartbeatJob?.isActive == true) return
-        heartbeatJob = lifecycleScope.launch {
-            while (isActive && isHosting) {
-                delay(5.seconds)
-                val fullSongName = if (!liveSongTitle.isNullOrEmpty()) {
-                    if (!liveArtist.isNullOrEmpty()) "$liveSongTitle - $liveArtist" else liveSongTitle
-                } else null
-
-                val code = apiService.sendHeartbeat(
-                    username = sessionManager.getUsername(),
-                    currentSong = fullSongName,
-                    currentCover = liveCoverUrl,
-                    durationMs = liveDurationMs,
-                    basePositionMs = liveBasePosMs,
-                    isPlaying = liveIsPlaying
-                )
-
-                if (code == 404) {
-                    handleRoomLostWhileHosting()
-                } else if (code in 200..299) {
-                    hostRetryCount = 0
-                }
-            }
-        }
-    }
-
-    private fun stopHeartbeat() {
-        heartbeatJob?.cancel()
-        heartbeatJob = null
-    }
-
-    private fun handleRoomLostWhileHosting() {
-        if (!isHosting || isPublishing) return
-
-        val info = currentRoomInfo ?: restoreHostingRoom()
-        if (info == null || hostRetryCount >= MAX_HOST_RETRY) {
-            isHosting = false
-            stopHeartbeat()
-            neriWatcher.stopWatching()
-            sessionManager.clearHostingRoom()
-            updateRoomUi(false, null, null, null, null)
-            showTip("房间已解散")
-            return
-        }
-
-        hostRetryCount++
-        showTip("正在重连房间...")
-        currentRoomInfo = info
-        executeBroadcastAction(info, action = "start", isResume = true)
-    }
-
-    private fun startPollingRoomStatus() {
-        if (pollingJob?.isActive == true) return
-        pollingJob = lifecycleScope.launch {
-            while (isActive) {
-                val interval = if (currentDeepLink != null) 6.seconds else 10.seconds
-                delay(interval)
-                fetchRoomStatusSequential()
-            }
-        }
-    }
-
-    private suspend fun fetchRoomStatusSequential() {
-        if (isPublishing) return
-
-        val result = apiService.getRoomStatus()
-        result.onSuccess { data ->
-            if (isPublishing) return@onSuccess
-
-            if (data.exists && !data.deepLink.isNullOrEmpty()) {
-                roomMissCount = 0
-                val info = NeriDeepLinkHelper.parseInvitation(data.deepLink)?.copy(
-                    currentSong = data.currentSong,
-                    currentCover = data.currentCover
-                )
-                val isNewRoom = currentRoomInfo == null || currentRoomInfo?.roomId != info?.roomId
-                val isSongChanged = currentRoomInfo?.currentSong != data.currentSong
-
-                if (isNewRoom) {
-                    currentRoomInfo = info
-                    applyRoomData(data)
-                } else if (isSongChanged && !isHosting) {
-                    currentRoomInfo = info
-                    applyRoomData(data)
-                }
-            } else {
-                // ⚡ 核心修复：如果是房主本人，严禁被单次轮询判定解散（房主生命线完全由心跳决定）
-                if (isHosting) return@onSuccess
-
-                roomMissCount++
-                if (roomMissCount >= ROOM_MISS_THRESHOLD) {
-                    currentRoomInfo = null
-                    currentDeepLink = null
-                    neriWatcher.stopWatching()
-                    updateRoomUi(false, null, null, null, null)
-                }
-            }
-        }
-    }
-
-    private fun executeBroadcastAction(info: RoomInfo?, action: String, isResume: Boolean = false) {
-        lifecycleScope.launch {
-            val result = apiService.broadcastRoom(action, sessionManager.getUsername(), info, isResume)
-
-            if (action == "start") {
-                isPublishing = false
-                btnPublishRoom.isEnabled = true
-                btnPublishRoom.text = "开启"
-                btnPasteInvite.isEnabled = true
-                etInviteCode.isEnabled = true
-
-                if (!result.isSuccess) {
-                    sessionManager.clearHostingRoom()
-                    isHosting = false
-                    stopHeartbeat()
-                    neriWatcher.stopWatching()
-                    updateRoomUi(false, null, null, null, null)
-                    showTip(result.message ?: "开启失败(${result.code})")
-                } else {
-                    etInviteCode.setText("")
-                    isHosting = true
-                    roomMissCount = 0
-                    hostRetryCount = 0
-
-                    val statusData = result.statusData
-                    val updatedInfo = info?.copy(
-                        currentSong = statusData?.currentSong,
-                        currentCover = statusData?.currentCover
-                    )
-                    currentRoomInfo = updatedInfo
-                    updatedInfo?.let { persistHostingRoom(it) }
-
-                    updateRoomUi(
-                        exists = true,
-                        inviter = info?.inviter ?: sessionManager.getUsername(),
-                        publisher = sessionManager.getUsername(),
-                        hostAvatarUrl = sessionManager.getAvatarUri(),
-                        deepLink = info?.rawUri,
-                        currentSong = statusData?.currentSong,
-                        currentCover = statusData?.currentCover
-                    )
-
-                    info?.let {
-                        val serverUrl = it.serverUrl ?: RoomApiService.DEFAULT_NERI_SERVER
-                        if (!it.roomId.isNullOrEmpty() && !it.secret.isNullOrEmpty()) {
-                            neriWatcher.startWatching(serverUrl, it.roomId, it.secret, sessionManager.getUsername())
-                        }
-                    }
-
-                    startHeartbeat()
-
-                    if (!isResume) {
-                        showTip("房间上线成功！")
-                    }
-                }
-            }
+            tvCurrentUserName.text = "未登录"
+            btnLogout.isVisible = true
+            btnLogout.text = "登录"
+            ivUserAvatar.setImageResource(R.drawable.bg_avatar_gray)
         }
     }
 }

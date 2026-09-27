@@ -1,239 +1,319 @@
 package com.example.social_music.net
 
-import com.example.social_music.model.RegisteredMember
+import com.example.social_music.model.ActiveRoom
+import com.example.social_music.model.MemberInfo
+import com.example.social_music.model.PlaybackPayload
 import com.example.social_music.model.RoomInfo
+import com.example.social_music.model.RoomSnapshot
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
+
+sealed class StateOutcome {
+    data class Ok(val snapshot: RoomSnapshot) : StateOutcome()
+    object Unauthorized : StateOutcome()
+    data class Failed(val message: String?) : StateOutcome()
+}
+
+sealed class StartOutcome {
+    data class Ok(val room: ActiveRoom?) : StartOutcome()
+    data class Conflict(val message: String) : StartOutcome()
+    object Unauthorized : StartOutcome()
+    data class Failed(val message: String?) : StartOutcome()
+}
+
+sealed class PushOutcome {
+    object Ok : PushOutcome()
+
+    /** 服务端已经没有属于我的房间了：心跳超时被回收，或者已被别人接管 */
+    object RoomLost : PushOutcome()
+    object Unauthorized : PushOutcome()
+    data class Failed(val message: String?) : PushOutcome()
+}
+
+sealed class ProfileOutcome {
+    data class Ok(val qq: String, val username: String, val avatarUrl: String) : ProfileOutcome()
+    object Unauthorized : ProfileOutcome()
+    data class Failed(val message: String?) : ProfileOutcome()
+}
 
 class RoomApiService {
 
     companion object {
-        const val BASE_URL = "https://white667.xyz/api"
-        const val DEFAULT_NERI_SERVER = "https://neriplayer.hancat.work"
+        private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
+
+        fun parseSnapshot(json: JSONObject): RoomSnapshot = RoomSnapshot(
+            version = json.optLong("version", 0L),
+            serverTime = json.optLong("serverTime", System.currentTimeMillis()),
+            room = parseRoom(json.optJSONObject("room")),
+            members = parseMembers(json.optJSONArray("members"))
+        )
+
+        /**
+         * org.json 的经典陷阱：JSON 里的 null 是 JSONObject.NULL 这个哨兵对象，
+         * optString 会把它 toString 成字面量 "null" —— 于是「当前没有歌曲」
+         * 就变成了一首名叫 null 的歌，封面还会去请求 https://.../null。
+         * 所有可空字符串字段都必须走这里读。
+         */
+        private fun JSONObject.optNullableString(key: String): String? {
+            if (isNull(key)) return null
+            return optString(key, "").trim().ifEmpty { null }
+        }
+
+        fun parseRoom(obj: JSONObject?): ActiveRoom? {
+            if (obj == null) return null
+            val roomId = obj.optNullableString("roomId") ?: return null
+
+            return ActiveRoom(
+                roomId = roomId,
+                inviter = obj.optNullableString("inviter"),
+                publisher = obj.optNullableString("publisher"),
+                publisherQq = obj.optNullableString("publisherQq"),
+                hostAvatarUrl = obj.optNullableString("hostAvatarUrl"),
+                deepLink = obj.optNullableString("deepLink"),
+                serverUrl = obj.optNullableString("serverUrl"),
+                currentSong = obj.optNullableString("currentSong"),
+                currentCover = obj.optNullableString("currentCover"),
+                durationMs = obj.optLong("durationMs", 0L),
+                basePositionMs = obj.optLong("basePositionMs", 0L),
+                baseTimestampMs = obj.optLong("baseTimestampMs", 0L),
+                playbackRate = obj.optDouble("playbackRate", 1.0),
+                isPlaying = obj.optBoolean("isPlaying", false)
+            )
+        }
+
+        fun parseMembers(arr: JSONArray?, defaultOnline: Boolean = true): List<MemberInfo> {
+            if (arr == null) return emptyList()
+            val out = ArrayList<MemberInfo>(arr.length())
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val name = obj.optNullableString("username") ?: continue
+                out.add(
+                    MemberInfo(
+                        qq = obj.optNullableString("qq").orEmpty(),
+                        username = name,
+                        avatarUrl = obj.optNullableString("avatarUrl").orEmpty(),
+                        isHosting = obj.optBoolean("isHosting", false),
+                        isOnline = if (obj.has("isOnline")) {
+                            obj.optBoolean("isOnline", defaultOnline)
+                        } else {
+                            defaultOnline
+                        }
+                    )
+                )
+            }
+            return out
+        }
+
+        private fun errorMessage(body: String, code: Int): String {
+            return try {
+                JSONObject(body).optString("message").ifBlank { "请求失败($code)" }
+            } catch (_: Exception) {
+                "请求失败($code)"
+            }
+        }
     }
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(6, TimeUnit.SECONDS)
-        .build()
+    // ==========================================================
+    // 房间状态
+    // ==========================================================
 
-    // 状态响应封装
-    data class StatusResult(
-        val exists: Boolean,
-        val inviter: String? = null,
-        val publisher: String? = null,
-        val hostAvatarUrl: String? = null,
-        val deepLink: String? = null,
-        val currentSong: String? = null,
-        val currentCover: String? = null,
-        val durationMs: Long = 0L,
-        val basePositionMs: Long = 0L,
-        val baseTimestampMs: Long = 0L,
-        val playbackRate: Double = 1.0,
-        val isPlaying: Boolean = true
-    )
-
-    data class BroadcastResult(
-        val isSuccess: Boolean,
-        val message: String? = null,
-        val code: Int = 200,
-        val statusData: StatusResult? = null
-    )
-
-    /**
-     * 查询房间状态
-     */
-    suspend fun getRoomStatus(force: Boolean = false): Result<StatusResult> = withContext(Dispatchers.IO) {
-        val url = if (force) "$BASE_URL/room/status?force=true" else "$BASE_URL/room/status"
-        val request = Request.Builder().url(url).get().build()
+    /** 一次性快照。长连接握手前先用它把首屏画出来，同时顺带验证 token。 */
+    suspend fun fetchState(token: String): StateOutcome = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url("${ApiConfig.BASE_URL}/room/state")
+            .addHeader("Authorization", "Bearer $token")
+            .get()
+            .build()
 
         try {
-            val response = client.newCall(request).execute()
-            val body = response.body?.string().orEmpty()
-            if (response.isSuccessful && body.isNotEmpty()) {
-                val json = JSONObject(body)
-                val exists = json.optBoolean("exists", false)
-                val status = StatusResult(
-                    exists = exists,
-                    inviter = json.optString("inviter", "").ifEmpty { null },
-                    publisher = json.optString("publisher", "").ifEmpty { null },
-                    hostAvatarUrl = json.optString("hostAvatarUrl", "").ifEmpty { null },
-                    deepLink = json.optString("deepLink", "").ifEmpty { null },
-                    currentSong = json.optString("currentSong", "").ifEmpty { null },
-                    currentCover = json.optString("currentCover", "").ifEmpty { null },
-                    durationMs = json.optLong("durationMs", 0L),
-                    basePositionMs = json.optLong("basePositionMs", 0L),
-                    baseTimestampMs = json.optLong("baseTimestampMs", System.currentTimeMillis()),
-                    playbackRate = json.optDouble("playbackRate", 1.0),
-                    isPlaying = json.optBoolean("isPlaying", true)
+            Http.client.newCall(request).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                when {
+                    response.code == 401 -> StateOutcome.Unauthorized
+                    response.isSuccessful && body.isNotEmpty() ->
+                        StateOutcome.Ok(parseSnapshot(JSONObject(body)))
+                    else -> StateOutcome.Failed(errorMessage(body, response.code))
+                }
+            }
+        } catch (e: Exception) {
+            StateOutcome.Failed(e.message)
+        }
+    }
+
+    suspend fun fetchProfile(token: String): ProfileOutcome = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url("${ApiConfig.BASE_URL}/user/me")
+            .addHeader("Authorization", "Bearer $token")
+            .get()
+            .build()
+
+        try {
+            Http.client.newCall(request).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (response.code == 401) return@use ProfileOutcome.Unauthorized
+                if (!response.isSuccessful || body.isEmpty()) {
+                    return@use ProfileOutcome.Failed(errorMessage(body, response.code))
+                }
+                val data = JSONObject(body).optJSONObject("data") ?: JSONObject()
+                ProfileOutcome.Ok(
+                    qq = data.optString("qq"),
+                    username = data.optString("username"),
+                    avatarUrl = data.optString("avatarUrl")
                 )
-                Result.success(status)
-            } else {
-                Result.failure(Exception("HTTP ${response.code}"))
+            }
+        } catch (e: Exception) {
+            ProfileOutcome.Failed(e.message)
+        }
+    }
+
+    /**
+     * 全部注册成员的花名册。名单本身是稳定的，只有 isOnline / isHosting
+     * 会随长连接实时变化，所以这里拉到的在线状态只是初值。
+     */
+    suspend fun fetchRoster(token: String): Result<List<MemberInfo>> = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url("${ApiConfig.BASE_URL}/user/list")
+            .addHeader("Authorization", "Bearer $token")
+            .get()
+            .build()
+
+        try {
+            Http.client.newCall(request).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful || body.isEmpty()) {
+                    return@use Result.failure(Exception(errorMessage(body, response.code)))
+                }
+                val json = JSONObject(body)
+                val arr = json.optJSONArray("data") ?: json.optJSONArray("list")
+                Result.success(parseMembers(arr, defaultOnline = false))
             }
         } catch (e: Exception) {
             Result.failure(e)
         }
     }
 
-    /**
-     * 发送房间广播（开播/恢复/停止）
-     */
-    suspend fun broadcastRoom(
-        action: String,
-        username: String,
-        info: RoomInfo?,
-        isResume: Boolean = false
-    ): BroadcastResult = withContext(Dispatchers.IO) {
-        val effectiveInviter = if (!info?.inviter.isNullOrBlank()) info.inviter else username
-        val json = JSONObject().apply {
-            put("action", action)
-            put("username", username)
-            if (isResume) put("resume", true)
-            if (info != null) {
-                put("roomId", info.roomId)
-                put("inviter", effectiveInviter)
-                put("publisher", username)
-                put("secret", info.secret)
-                put("deepLink", info.rawUri)
-                put("serverUrl", info.serverUrl ?: DEFAULT_NERI_SERVER)
-            }
+    // ==========================================================
+    // 房主操作
+    // ==========================================================
+
+    suspend fun hostStart(token: String, info: RoomInfo): StartOutcome = withContext(Dispatchers.IO) {
+        val payload = JSONObject().apply {
+            put("roomId", info.roomId)
+            put("inviter", info.inviter ?: "")
+            put("secret", info.secret ?: "")
+            put("deepLink", info.rawUri)
+            put("serverUrl", info.serverUrl ?: ApiConfig.DEFAULT_NERI_SERVER)
         }
 
-        val requestBody = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-        val request = Request.Builder().url("$BASE_URL/broadcast").post(requestBody).build()
+        val request = Request.Builder()
+            .url("${ApiConfig.BASE_URL}/room/host/start")
+            .addHeader("Authorization", "Bearer $token")
+            .post(payload.toString().toRequestBody(JSON_MEDIA))
+            .build()
 
         try {
-            val response = client.newCall(request).execute()
-            val body = response.body?.string().orEmpty()
-            val isOk = response.isSuccessful
-
-            var errMsg: String? = null
-            var statusData: StatusResult? = null
-
-            if (!isOk) {
-                errMsg = "操作失败(${response.code})"
-                try {
-                    val errJson = JSONObject(body)
-                    errMsg = errJson.optString("message", errMsg)
-                } catch (_: Exception) {}
-            } else {
-                try {
-                    val resData = JSONObject(body).optJSONObject("data")
-                    if (resData != null) {
-                        statusData = StatusResult(
-                            exists = true,
-                            inviter = effectiveInviter,
-                            publisher = username,
-                            deepLink = info?.rawUri,
-                            hostAvatarUrl = resData.optString("hostAvatarUrl", "").ifEmpty { null },
-                            currentSong = resData.optString("currentSong", "").ifEmpty { null },
-                            currentCover = resData.optString("currentCover", "").ifEmpty { null },
-                            durationMs = resData.optLong("durationMs", 0L),
-                            basePositionMs = resData.optLong("basePositionMs", 0L),
-                            baseTimestampMs = resData.optLong("baseTimestampMs", System.currentTimeMillis()),
-                            playbackRate = resData.optDouble("playbackRate", 1.0),
-                            isPlaying = resData.optBoolean("isPlaying", true)
-                        )
-                    }
-                } catch (_: Exception) {}
-            }
-            BroadcastResult(isSuccess = isOk, message = errMsg, code = response.code, statusData = statusData)
-        } catch (e: Exception) {
-            BroadcastResult(isSuccess = false, message = "网络异常：${e.message}", code = -1)
-        }
-    }
-
-    /**
-     * 发送心跳包（⚡ 关键升级：支持将房主当前播放的实时歌曲同步到服务器 Redis，供所有群友获取）
-     */
-    suspend fun sendHeartbeat(
-        username: String,
-        currentSong: String? = null,
-        currentCover: String? = null,
-        durationMs: Long = 0L,
-        basePositionMs: Long = 0L,
-        isPlaying: Boolean = true
-    ): Int = withContext(Dispatchers.IO) {
-        val json = JSONObject().apply {
-            put("action", "heartbeat")
-            put("username", username)
-            // 房主将 WebSocket 拿到的实时歌曲同步至服务端 Redis
-            if (!currentSong.isNullOrEmpty()) {
-                put("currentSong", currentSong)
-                put("currentCover", currentCover ?: "")
-                put("durationMs", durationMs)
-                put("basePositionMs", basePositionMs)
-                put("isPlaying", isPlaying)
-            }
-        }
-        val requestBody = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-        val request = Request.Builder().url("$BASE_URL/broadcast").post(requestBody).build()
-
-        try {
-            val response = client.newCall(request).execute()
-            val code = response.code
-            response.close()
-            code
-        } catch (e: Exception) {
-            -1
-        }
-    }
-
-    /**
-     * 获取成员列表
-     */
-    suspend fun fetchMemberList(token: String?): Result<List<RegisteredMember>> = withContext(Dispatchers.IO) {
-        val requestBuilder = Request.Builder().url("$BASE_URL/user/list").get()
-        if (!token.isNullOrEmpty()) {
-            requestBuilder.addHeader("Authorization", "Bearer $token")
-        }
-
-        try {
-            val response = client.newCall(requestBuilder.build()).execute()
-            val body = response.body?.string().orEmpty()
-            val list = mutableListOf<RegisteredMember>()
-
-            if (response.isSuccessful && body.isNotEmpty()) {
-                val trimmed = body.trim()
-                val dataArray = if (trimmed.startsWith("[")) {
-                    JSONArray(trimmed)
-                } else {
-                    val json = JSONObject(trimmed)
-                    json.optJSONArray("data")
-                        ?: json.optJSONArray("users")
-                        ?: json.optJSONArray("list")
-                        ?: json.optJSONArray("members")
+            Http.client.newCall(request).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                val json = try {
+                    JSONObject(body)
+                } catch (_: Exception) {
+                    JSONObject()
                 }
 
-                if (dataArray != null) {
-                    for (i in 0 until dataArray.length()) {
-                        val obj = dataArray.getJSONObject(i)
-                        val name = obj.optString("username", obj.optString("name", "")).trim()
-                        if (name.isNotEmpty()) {
-                            list.add(
-                                RegisteredMember(
-                                    username = name,
-                                    avatarUrl = obj.optString("avatarUrl", obj.optString("avatar", "")),
-                                    isHosting = obj.optBoolean("isHosting", false)
-                                )
-                            )
+                when {
+                    response.code == 401 -> StartOutcome.Unauthorized
+                    response.code == 409 -> StartOutcome.Conflict(
+                        json.optString("message").ifBlank { "当前已有其他人在放歌" }
+                    )
+                    response.isSuccessful -> StartOutcome.Ok(parseRoom(json.optJSONObject("data")))
+                    else -> StartOutcome.Failed(
+                        json.optString("message").ifBlank { "开启失败(${response.code})" }
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            StartOutcome.Failed("网络异常：${e.message}")
+        }
+    }
+
+    /** 上报播放状态；playback 为 null 时是纯保活心跳 */
+    suspend fun hostPushState(token: String, playback: PlaybackPayload?): PushOutcome =
+        withContext(Dispatchers.IO) {
+            val payload = JSONObject()
+            if (playback != null) {
+                payload.put("playback", JSONObject().apply {
+                    put("currentSong", playback.currentSong ?: JSONObject.NULL)
+                    put("currentCover", playback.currentCover ?: JSONObject.NULL)
+                    put("durationMs", playback.durationMs)
+                    put("basePositionMs", playback.basePositionMs)
+                    put("isPlaying", playback.isPlaying)
+                    put("playbackRate", playback.playbackRate)
+                })
+            }
+
+            val request = Request.Builder()
+                .url("${ApiConfig.BASE_URL}/room/host/state")
+                .addHeader("Authorization", "Bearer $token")
+                .post(payload.toString().toRequestBody(JSON_MEDIA))
+                .build()
+
+            try {
+                Http.client.newCall(request).execute().use { response ->
+                    when {
+                        response.code == 401 -> PushOutcome.Unauthorized
+                        // 404 = 房间没了，403 = 房主换人了，对本地而言都是「丢了」
+                        response.code == 404 || response.code == 403 -> PushOutcome.RoomLost
+                        response.isSuccessful -> PushOutcome.Ok
+                        else -> {
+                            val body = response.body?.string().orEmpty()
+                            PushOutcome.Failed(errorMessage(body, response.code))
                         }
                     }
                 }
-                Result.success(list)
-            } else {
-                Result.failure(Exception("HTTP ${response.code}"))
+            } catch (e: Exception) {
+                PushOutcome.Failed(e.message)
             }
+        }
+
+    suspend fun hostStop(token: String): Boolean = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url("${ApiConfig.BASE_URL}/room/host/stop")
+            .addHeader("Authorization", "Bearer $token")
+            .post("{}".toRequestBody(JSON_MEDIA))
+            .build()
+
+        try {
+            Http.client.newCall(request).execute().use { it.isSuccessful }
         } catch (e: Exception) {
-            Result.failure(e)
+            false
         }
     }
+
+    suspend fun updateUsername(token: String, newName: String): Pair<Boolean, String?> =
+        withContext(Dispatchers.IO) {
+            val payload = JSONObject().apply { put("newUsername", newName) }
+            val request = Request.Builder()
+                .url("${ApiConfig.BASE_URL}/user/update-name")
+                .addHeader("Authorization", "Bearer $token")
+                .post(payload.toString().toRequestBody(JSON_MEDIA))
+                .build()
+
+            try {
+                Http.client.newCall(request).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (response.isSuccessful) {
+                        true to null
+                    } else {
+                        false to errorMessage(body, response.code)
+                    }
+                }
+            } catch (e: Exception) {
+                false to "网络异常：${e.message}"
+            }
+        }
 }

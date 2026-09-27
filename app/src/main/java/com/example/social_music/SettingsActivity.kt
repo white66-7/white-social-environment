@@ -11,21 +11,15 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
 import coil.load
 import coil.transform.CircleCropTransformation
+import com.example.social_music.net.RoomApiService
 import com.example.social_music.utils.CapsuleTipManager
 import com.example.social_music.utils.SessionManager
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.imageview.ShapeableImageView
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
-import org.json.JSONObject
-import java.io.IOException
+import kotlinx.coroutines.launch
 
 class SettingsActivity : AppCompatActivity() {
 
@@ -34,7 +28,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private lateinit var tvUsername: TextView
     private lateinit var ivAvatar: ShapeableImageView
-    private val client = OkHttpClient()
+    private val api = RoomApiService()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -195,53 +189,24 @@ class SettingsActivity : AppCompatActivity() {
     // 同步到后端并在成功后弹出胶囊提示
     // =========================================================================
     private fun updateUsernameToServer(newName: String) {
-        val avatarUrl = sessionManager.getAvatarUri().orEmpty()
-        val qqNumber = if (avatarUrl.contains("nk=")) {
-            avatarUrl.substringAfter("nk=").substringBefore("&")
-        } else {
-            ""
-        }
-        val token = sessionManager.getToken().orEmpty()
-
-        val json = JSONObject().apply {
-            put("qq", qqNumber)
-            put("token", token)
-            put("newUsername", newName)
+        // 身份一律由 token 决定。旧版是从头像 URL 里正则抠出 QQ 号再发给服务端，
+        // 服务端又完全信任这个 QQ —— 等于任何人都能改别人的昵称。
+        val token = sessionManager.getToken()
+        if (token.isNullOrEmpty()) {
+            showTip("登录状态已失效，请重新登录")
+            return
         }
 
-        val requestBody = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
-        val request = Request.Builder()
-            .url("https://white667.xyz/api/user/update-name")
-            .post(requestBody)
-            .build()
-
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                android.util.Log.e("SettingsActivity", "改名请求失败", e)
-                runOnUiThread {
-                    showTip("网络异常: ${e.localizedMessage ?: "连接失败"}")
-                }
+        lifecycleScope.launch {
+            val (isOk, errorMessage) = api.updateUsername(token, newName)
+            if (isOk) {
+                tvUsername.text = newName
+                sessionManager.saveUsername(newName)
+                showTip("昵称修改为：$newName")
+            } else {
+                showTip(errorMessage ?: "保存失败")
             }
-
-            override fun onResponse(call: Call, response: Response) {
-                val body = response.body?.string().orEmpty()
-                android.util.Log.d("SettingsActivity", "改名响应: ${response.code} $body")
-
-                runOnUiThread {
-                    if (response.isSuccessful) {
-                        tvUsername.text = newName
-                        sessionManager.saveUsername(newName)
-                        showTip("昵称修改为：$newName")
-                    } else {
-                        var errMsg = "保存失败"
-                        try {
-                            errMsg = JSONObject(body).optString("message", errMsg)
-                        } catch (_: Exception) {}
-                        showTip(errMsg)
-                    }
-                }
-            }
-        })
+        }
     }
 
     private fun showLogoutConfirmDialog() {

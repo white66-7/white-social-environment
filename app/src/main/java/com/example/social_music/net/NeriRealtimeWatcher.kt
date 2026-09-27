@@ -37,7 +37,7 @@ class NeriRealtimeWatcher(
         private const val KEY_DEVICE_UUID = "device_uuid"
     }
 
-    // ⚡ 核心修复：为每台设备分配持久化唯一 UUID，杜绝多个用户互相把对方踢下线
+    // ⚡ 每台设备持久化分配独立 UUID，杜绝多个用户共用相同静态 UUID 导致互相顶号
     private val deviceUuid: String by lazy {
         val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
         var id = sp.getString(KEY_DEVICE_UUID, null)
@@ -134,7 +134,7 @@ class NeriRealtimeWatcher(
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         if (webSocket !== activeWebSocket) return
                         isConnecting = false
-                        Log.i(TAG, "🚀 Neri WebSocket 连接成功！监听中...")
+                        Log.i(TAG, "🚀 Neri WebSocket 连接成功！正在监听切歌事件...")
                     }
 
                     override fun onMessage(webSocket: WebSocket, text: String) {
@@ -155,7 +155,6 @@ class NeriRealtimeWatcher(
                     }
 
                     override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                        // ⚡ 网络原因正常关闭，严禁当作房间解散，做静默重连
                         if (webSocket !== activeWebSocket || isClosedManually) return
                         scheduleSilentRetry(serverUrl, roomId, secret, userNickname)
                     }
@@ -167,7 +166,7 @@ class NeriRealtimeWatcher(
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                         if (webSocket !== activeWebSocket || isClosedManually) return
-                        Log.w(TAG, "WebSocket 连接波动: ${t.message}，正在静默重连...")
+                        Log.w(TAG, "WebSocket 波动异常: ${t.message}，正在静默重连...")
                         if (response?.code in listOf(404, 410)) {
                             notifyRoomClosed()
                         } else {
@@ -184,6 +183,10 @@ class NeriRealtimeWatcher(
                 }
             } finally {
                 activeJoinCall = null
+                // 无论走哪条分支都要清掉「正在连接」标记。
+                // 那些提前 return 的分支（房间失效 / token 为空）如果漏掉它，
+                // startWatching 的幂等检查会认为连接还在，同一房间号就再也连不上了。
+                isConnecting = false
             }
         }.start()
     }
@@ -276,6 +279,8 @@ class NeriRealtimeWatcher(
     fun stopWatching() {
         isClosedManually = true
         isConnecting = false
+        // ⚡ 彻底清除 Handler 内部所有待执行的重试任务，防止新房间上线时被旧重试回调打乱
+        mainHandler.removeCallbacksAndMessages(null)
         activeJoinCall?.cancel()
         activeJoinCall = null
         activeWebSocket?.close(1000, "Normal Close")

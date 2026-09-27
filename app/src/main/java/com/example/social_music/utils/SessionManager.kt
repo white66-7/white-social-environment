@@ -10,6 +10,7 @@ class SessionManager(context: Context) {
 
     companion object {
         private const val KEY_TOKEN = "jwt_token"
+        private const val KEY_QQ = "auth_qq"
         private const val KEY_USERNAME = "auth_username"
         private const val KEY_AVATAR_URI = "auth_avatar_uri"
         private const val KEY_HOSTING_ROOM = "hosting_room_json"
@@ -20,6 +21,14 @@ class SessionManager(context: Context) {
             putString(KEY_TOKEN, token)
             putString(KEY_USERNAME, username)
         }
+    }
+
+    fun saveQq(qq: String) {
+        prefs.edit { putString(KEY_QQ, qq) }
+    }
+
+    fun getQq(): String {
+        return prefs.getString(KEY_QQ, "") ?: ""
     }
 
     fun saveUsername(username: String) {
@@ -43,6 +52,7 @@ class SessionManager(context: Context) {
     }
 
     // ===== 房主身份持久化 =====
+    // 存的是含密钥的房间信息。进程被杀后靠它把房主身份和 Neri 长连接接回来。
     fun saveHostingRoom(json: String) {
         prefs.edit { putString(KEY_HOSTING_ROOM, json) }
     }

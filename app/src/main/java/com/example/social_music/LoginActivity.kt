@@ -7,31 +7,24 @@ import android.view.KeyEvent
 import android.widget.EditText
 import android.widget.ImageView
 import androidx.appcompat.app.AppCompatActivity
+import com.example.social_music.net.ApiConfig
+import com.example.social_music.net.Http
 import com.example.social_music.utils.CapsuleTipManager
 import com.example.social_music.utils.SessionManager
 import com.google.android.material.button.MaterialButton
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONObject
 import java.io.IOException
-import java.util.concurrent.TimeUnit
 
 class LoginActivity : AppCompatActivity() {
 
     private lateinit var sessionManager: SessionManager
     private lateinit var tipManager: CapsuleTipManager
-
-    // 15 秒长稳态客户端，抵御冷启动
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
-        .build()
 
     private lateinit var etQqNumber: EditText
     private lateinit var pin1: EditText
@@ -131,11 +124,11 @@ class LoginActivity : AppCompatActivity() {
         val requestBody = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
 
         val request = Request.Builder()
-            .url("https://white667.xyz/api/auth/login")
+            .url("${ApiConfig.BASE_URL}/auth/login")
             .post(requestBody)
             .build()
 
-        client.newCall(request).enqueue(object : Callback {
+        Http.client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 runOnUiThread {
                     btnLogin.isEnabled = true
@@ -160,6 +153,8 @@ class LoginActivity : AppCompatActivity() {
 
                             sessionManager.saveAuthToken(token, nickname)
                             sessionManager.saveAvatarUri(avatarUrl)
+                            // qq 才是稳定身份，昵称随时可改，比对成员/房主都要用它
+                            sessionManager.saveQq(userObj?.optString("qq", "").orEmpty())
 
                             showTip("认证成功: $nickname")
                             // 延时 400ms 退出，确保用户能看清药丸提示

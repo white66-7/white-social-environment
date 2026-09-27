@@ -62,6 +62,21 @@
                     android:textSize="10sp"
                     android:textStyle="bold"
                     android:visibility="gone" />
+
+                <!-- 在线角标：只有当前有长连接在线的成员才显示 -->
+                <TextView
+                    android:id="@+id/tvOnlineBadge"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="6dp"
+                    android:background="#DCFCE7"
+                    android:paddingHorizontal="6dp"
+                    android:paddingVertical="2dp"
+                    android:text="在线"
+                    android:textColor="#15803D"
+                    android:textSize="10sp"
+                    android:textStyle="bold"
+                    android:visibility="gone" />
             </LinearLayout>
 
         </LinearLayout>
