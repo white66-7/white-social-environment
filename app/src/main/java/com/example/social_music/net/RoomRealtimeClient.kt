@@ -36,10 +36,16 @@ class RoomRealtimeClient(private val listener: Listener) {
     companion object {
         private const val TAG = "RoomRealtime"
         private const val INITIAL_BACKOFF_MS = 1_000L
-        private const val MAX_BACKOFF_MS = 15_000L
+
+        /**
+         * 退避上限。原来 15 秒太长：跨境链路本来就不稳，
+         * 一次掉线要等十几秒才恢复，用户看到的就是「房间状态卡住了」。
+         */
+        private const val MAX_BACKOFF_MS = 5_000L
     }
 
     private val client = OkHttpClient.Builder()
+        .dns(EdgeDns)
         .connectTimeout(10, TimeUnit.SECONDS)
         // 长连接不能设读超时，否则空闲一会儿就被判死
         .readTimeout(0, TimeUnit.MILLISECONDS)

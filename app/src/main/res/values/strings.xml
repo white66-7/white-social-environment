@@ -9,4 +9,12 @@
     <string name="room_id_format">房间号: %1$s</string>
     <string name="room_unknown_id">未知</string>
     <string name="room_default_inviter">群友</string>
+
+    <!-- 开播期间的前台服务通知 -->
+    <string name="sync_channel_name">放歌同步</string>
+    <string name="sync_channel_desc">开播期间保持房间播放状态持续同步</string>
+    <string name="sync_notification_title">正在放歌</string>
+    <string name="sync_notification_connecting">正在连接播放器…</string>
+    <string name="sync_notification_idle">等待播放</string>
+    <string name="sync_notification_stop">停止</string>
 </resources>

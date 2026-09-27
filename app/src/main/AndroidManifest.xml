@@ -4,6 +4,12 @@
     <!-- 允许网络请求 -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- 开播期间用前台服务保住放歌会话，防止进程被回收 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- API 33+ 显示通知栏需要；用户拒绝时前台服务照常运行，只是通知不可见 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!-- 适配 Android 11+ 包可见性规则，允许检测并跳转 NeriPlayer -->
     <queries>
         <intent>
@@ -40,6 +46,18 @@
         <activity
             android:name=".SettingsActivity"
             android:screenOrientation="portrait" />
+
+        <!--
+          开播期间的前台服务：只为保住放歌会话不被系统回收。
+
+          stopWithTask="false"（也是默认值）是关键 —— 用户从最近任务划掉 App 时
+          服务不会被一起停掉，放歌和切歌同步得以继续。
+        -->
+        <service
+            android:name=".service.MusicSyncService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="dataSync" />
 
     </application>
 </manifest>

@@ -14,6 +14,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import coil.load
 import coil.transform.CircleCropTransformation
+import com.example.social_music.manager.HostSession
 import com.example.social_music.net.RoomApiService
 import com.example.social_music.utils.CapsuleTipManager
 import com.example.social_music.utils.SessionManager
@@ -223,6 +224,17 @@ class SettingsActivity : AppCompatActivity() {
         btnCancel.setOnClickListener { dialog.dismiss() }
         btnConfirm.setOnClickListener {
             dialog.dismiss()
+
+            // 必须先收掉房主会话、再清 session。
+            // clearSession() 会把 token 和房主记录一起抹掉，顺序反了的话
+            // HostSession 就再也读不到 token 去说再见，前台服务和保活循环会一直挂到
+            // 系统的 dataSync 时限（6 小时）才被回收。
+            HostSession.init(applicationContext)
+            HostSession.stop(
+                notifyServer = true,
+                reason = HostSession.StopReason.USER
+            )
+
             sessionManager.clearSession()
             showTip("退出登录")
             finish()

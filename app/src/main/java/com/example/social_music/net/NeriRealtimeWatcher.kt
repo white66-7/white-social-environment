@@ -53,6 +53,7 @@ class NeriRealtimeWatcher(
      * 复用主客户端不行 —— 它的读超时是 12 秒，探测一旦卡住会把重连一起拖死。
      */
     private val probeClient = OkHttpClient.Builder()
+        .dns(EdgeDns)
         .connectTimeout(PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .readTimeout(PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .build()
@@ -69,6 +70,7 @@ class NeriRealtimeWatcher(
     }
 
     private val client = OkHttpClient.Builder()
+        .dns(EdgeDns)
         .connectTimeout(6, TimeUnit.SECONDS)
         .readTimeout(12, TimeUnit.SECONDS)
         .pingInterval(10, TimeUnit.SECONDS)
@@ -93,6 +95,36 @@ class NeriRealtimeWatcher(
      * 表现就是房主端一直停在「你正在放歌」、谁也关不掉。
      */
     @Volatile private var generation = 0
+
+    /**
+     * 预热到播放器服务器的 TCP+TLS。
+     *
+     * 开房那一次 join 是**新建连接**，握手成本实测最坏到过 5.7 秒，全砸在用户点「开启」
+     * 之后。而连接池是按 OkHttpClient 实例算的，所以必须用**这个类自己的 client**
+     * 去预热才有意义 —— 拿别的 client 预热，连接落在别的池子里，等于白做。
+     *
+     * 用户粘完口令、手指还没点到「开启」的那一两秒就是白捡的时间。
+     * 这个方法本身不产生任何业务副作用：只发一个读得到响应体的轻量 GET，
+     * 让 TCP+TLS 建好并把连接还回池子，**不会**去 join 房间（那会往房间里塞一个机器人）。
+     */
+    fun preconnect(serverUrl: String) {
+        val base = serverUrl.trim().removeSuffix("/")
+        if (base.isEmpty()) return
+
+        Thread {
+            try {
+                val request = Request.Builder().url("$base/api/health").get().build()
+                client.newCall(request).execute().use { response ->
+                    // 必须把响应体读完，OkHttp 才会把这个连接放回池子复用
+                    response.body?.string()
+                    Log.i(TAG, "播放器连接预热完成 code=${response.code}")
+                }
+            } catch (e: Exception) {
+                // 预热失败无所谓，真正 join 的时候会照常再连一次
+                Log.i(TAG, "播放器连接预热失败（忽略）: ${e.message}")
+            }
+        }.start()
+    }
 
     @Synchronized
     fun startWatching(serverUrl: String, roomId: String, secret: String, userNickname: String = "群友伴侣") {

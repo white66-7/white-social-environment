@@ -53,5 +53,13 @@ data class PlaybackPayload(
     val durationMs: Long,
     val basePositionMs: Long,
     val isPlaying: Boolean,
-    val playbackRate: Double = 1.0
+    val playbackRate: Double = 1.0,
+    /**
+     * 单调递增的上报序号。
+     *
+     * 跨境链路上往返 1~8 秒，并发的上报必然乱序落地。服务端靠它丢弃迟到的那条，
+     * 否则一次迟到的「上一首」会把刚切的新歌覆盖回去 —— 表现出来就是「切歌没反应」。
+     * 0 表示不带序号（服务端按老逻辑处理）。
+     */
+    val seq: Long = 0L
 )

@@ -7,6 +7,7 @@ import com.example.social_music.model.RoomInfo
 import com.example.social_music.model.RoomSnapshot
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -20,7 +21,11 @@ sealed class StateOutcome {
 }
 
 sealed class StartOutcome {
-    data class Ok(val room: ActiveRoom?) : StartOutcome()
+    /**
+     * [pending] = 服务端先受理了一个「未确认」房间，它此刻对成员端还不可见 ——
+     * 口令校验通过后要靠 confirm 上报才会亮出来。见 MainActivity 的并行开房流程。
+     */
+    data class Ok(val room: ActiveRoom?, val pending: Boolean = false) : StartOutcome()
     data class Conflict(val message: String) : StartOutcome()
     object Unauthorized : StartOutcome()
     data class Failed(val message: String?) : StartOutcome()
@@ -28,6 +33,9 @@ sealed class StartOutcome {
 
 sealed class PushOutcome {
     object Ok : PushOutcome()
+
+    /** 服务端已经把这条判为迟到/重复，丢弃了。不是错误。 */
+    object Stale : PushOutcome()
 
     /** 服务端已经没有属于我的房间了：心跳超时被回收，或者已被别人接管 */
     object RoomLost : PushOutcome()
@@ -201,13 +209,23 @@ class RoomApiService {
     // 房主操作
     // ==========================================================
 
-    suspend fun hostStart(token: String, info: RoomInfo): StartOutcome = withContext(Dispatchers.IO) {
+    /**
+     * 开房。[pending] = true 时服务端先受理一个「未确认」房间：
+     * 它对成员端不可见，等口令校验通过后由 [hostPushState] 的 confirm 点亮。
+     * 这样开房可以和播放器的 join 并行，省掉一整次跨境往返。
+     */
+    suspend fun hostStart(
+        token: String,
+        info: RoomInfo,
+        pending: Boolean = false
+    ): StartOutcome = withContext(Dispatchers.IO) {
         val payload = JSONObject().apply {
             put("roomId", info.roomId)
             put("inviter", info.inviter ?: "")
             put("secret", info.secret ?: "")
             put("deepLink", info.rawUri)
             put("serverUrl", info.serverUrl ?: ApiConfig.DEFAULT_NERI_SERVER)
+            if (pending) put("pending", true)
         }
 
         val request = Request.Builder()
@@ -230,7 +248,10 @@ class RoomApiService {
                     response.code == 409 -> StartOutcome.Conflict(
                         json.optString("message").ifBlank { "当前已有其他人在放歌" }
                     )
-                    response.isSuccessful -> StartOutcome.Ok(parseRoom(json.optJSONObject("data")))
+                    response.isSuccessful -> StartOutcome.Ok(
+                        room = parseRoom(json.optJSONObject("data")),
+                        pending = json.optBoolean("pending", false)
+                    )
                     else -> StartOutcome.Failed(
                         json.optString("message").ifBlank { "开启失败(${response.code})" }
                     )
@@ -241,8 +262,20 @@ class RoomApiService {
         }
     }
 
-    /** 上报播放状态；playback 为 null 时是纯保活心跳 */
-    suspend fun hostPushState(token: String, playback: PlaybackPayload?): PushOutcome =
+    /**
+     * 上报播放状态；playback 为 null 时是纯保活心跳。
+     *
+     * [confirm] 用于把服务端那个「未确认」的 pending 房间点亮（口令校验通过时）。
+     *
+     * [onCall] 在请求真正发出前回调，让调用方拿到 [Call] 以便取消 ——
+     * 切歌要能立刻顶掉一次在途的、已经过时的位置上报，不然就得排在它后面等上好几秒。
+     */
+    suspend fun hostPushState(
+        token: String,
+        playback: PlaybackPayload?,
+        confirm: Boolean = false,
+        onCall: ((Call) -> Unit)? = null
+    ): PushOutcome =
         withContext(Dispatchers.IO) {
             val payload = JSONObject()
             if (playback != null) {
@@ -253,8 +286,10 @@ class RoomApiService {
                     put("basePositionMs", playback.basePositionMs)
                     put("isPlaying", playback.isPlaying)
                     put("playbackRate", playback.playbackRate)
+                    if (playback.seq > 0) put("seq", playback.seq)
                 })
             }
+            if (confirm) payload.put("confirm", true)
 
             val request = Request.Builder()
                 .url("${ApiConfig.BASE_URL}/room/host/state")
@@ -263,12 +298,20 @@ class RoomApiService {
                 .build()
 
             try {
-                Http.client.newCall(request).execute().use { response ->
+                val call = Http.client.newCall(request)
+                onCall?.invoke(call)
+                call.execute().use { response ->
                     when {
                         response.code == 401 -> PushOutcome.Unauthorized
                         // 404 = 房间没了，403 = 房主换人了，对本地而言都是「丢了」
                         response.code == 404 || response.code == 403 -> PushOutcome.RoomLost
-                        response.isSuccessful -> PushOutcome.Ok
+                        response.isSuccessful -> {
+                            val body = response.body?.string().orEmpty()
+                            // 服务端说这条迟到/重复，已经被丢弃 —— 不是错误，但要知道
+                            if (runCatching { JSONObject(body).optBoolean("stale", false) }
+                                    .getOrDefault(false)
+                            ) PushOutcome.Stale else PushOutcome.Ok
+                        }
                         else -> {
                             val body = response.body?.string().orEmpty()
                             PushOutcome.Failed(errorMessage(body, response.code))
@@ -280,11 +323,23 @@ class RoomApiService {
             }
         }
 
-    suspend fun hostStop(token: String): Boolean = withContext(Dispatchers.IO) {
+    /**
+     * 关播。
+     *
+     * [roomId] 用来把这次关房**限定在指定的那个房间**上。不带的话服务端按
+     * 「关掉这个用户当前的房间」处理 —— 一旦有迟到请求（关播后立刻重开、
+     * 或一次已作废的开房请求延迟撤销），它会把刚开好的新房一起关掉，
+     * 而界面还显示着「房间上线成功」。所以凡是知道房间号的调用都要带上。
+     */
+    suspend fun hostStop(token: String, roomId: String? = null): Boolean = withContext(Dispatchers.IO) {
+        val payload = JSONObject().apply {
+            if (!roomId.isNullOrEmpty()) put("roomId", roomId)
+        }
+
         val request = Request.Builder()
             .url("${ApiConfig.BASE_URL}/room/host/stop")
             .addHeader("Authorization", "Bearer $token")
-            .post("{}".toRequestBody(JSON_MEDIA))
+            .post(payload.toString().toRequestBody(JSON_MEDIA))
             .build()
 
         try {

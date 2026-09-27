@@ -1,10 +1,15 @@
 package com.example.social_music
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -14,21 +19,21 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
 import androidx.lifecycle.lifecycleScope
 import coil.load
 import coil.transform.CircleCropTransformation
+import com.example.social_music.manager.HostSession
+import com.example.social_music.manager.LivePlayback
 import com.example.social_music.manager.PlaybackProgressTracker
 import com.example.social_music.model.ActiveRoom
 import com.example.social_music.model.MemberInfo
-import com.example.social_music.model.PlaybackPayload
 import com.example.social_music.model.RoomInfo
 import com.example.social_music.model.RoomSnapshot
-import com.example.social_music.net.ApiConfig
-import com.example.social_music.net.NeriRealtimeWatcher
 import com.example.social_music.net.ProfileOutcome
-import com.example.social_music.net.PushOutcome
 import com.example.social_music.net.RoomApiService
 import com.example.social_music.net.RoomRealtimeClient
 import com.example.social_music.net.StartOutcome
@@ -41,9 +46,7 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.imageview.ShapeableImageView
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import org.json.JSONObject
 
 /**
  * 单一权威状态来源：服务端快照。
@@ -55,21 +58,11 @@ import org.json.JSONObject
  *
  * 界面结构与控件完全沿用原有布局，没有改动 UI。
  */
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), HostSession.Listener {
 
     companion object {
         private const val TAG = "MainActivity"
         private const val MAX_HOST_REVIVE = 3
-        private const val HOST_KEEPALIVE_INTERVAL_MS = 20_000L
-
-        /**
-         * 房主记录的有效期。超过这个时间就不再自动重新挂载房间 ——
-         * 否则「昨天开过房、今天打开 App」会凭空拉起一个没人听的僵尸房间。
-         */
-        private const val HOST_RECORD_MAX_AGE_MS = 30 * 60 * 1000L
-
-        /** 刷新房主记录时间戳的最小间隔，避免每 20 秒就写一次 SharedPreferences */
-        private const val RECORD_REFRESH_INTERVAL_MS = 5 * 60 * 1000L
 
         /** 花名册缓存时长：名单很少变，在线角标走长连接实时刷新，不必频繁重拉 */
         private const val ROSTER_CACHE_MS = 30_000L
@@ -91,9 +84,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tipManager: CapsuleTipManager
     private lateinit var progressTracker: PlaybackProgressTracker
     private lateinit var realtime: RoomRealtimeClient
-
-    /** 只在房主身份下启用：连 NeriPlayer 感知切歌。成员端绝不连，避免房间里多出机器人 */
-    private lateinit var neriWatcher: NeriRealtimeWatcher
 
     // ---------- 权威状态 ----------
     private var snapshot: RoomSnapshot? = null
@@ -118,38 +108,61 @@ class MainActivity : AppCompatActivity() {
     private var onlineQq: Set<String> = emptySet()
     private var hostQq: String? = null
 
+    /**
+     * 实时通道当前是断的。
+     *
+     * 断线时画面刻意保持不动（清空才是「成员一会儿一个一会儿两个」那类抖动的来源），
+     * 但得让用户知道看到的东西可能已经过时，不然一首早就切掉的歌会一直显示成正在播放。
+     */
+    private var realtimeDown = false
+
     // ---------- 房主本地状态 ----------
-    /** 本地是否正以房主身份向服务器上报（决定是否维持 Neri 长连接与保活循环） */
-    private var isHosting = false
+    // Neri 长连接、保活循环、状态上报和房主记录都已经搬进 HostSession ——
+    // 它们必须活过 Activity 的销毁，否则用户划掉 App 房间就成僵尸了。
+    // 这里只留「界面自己的」流程状态。
     private var isPublishing = false
     private var isRevivingHost = false
     private var hostReviveCount = 0
-    private var currentRoomInfo: RoomInfo? = null
-    private var lastRecordRefreshAt = 0L
+
+    /**
+     * 服务端明确说过「这个用户已经没有房间了」。
+     *
+     * 这是重挂的**唯一**依据。不能拿「快照里 room == null」当依据 ——
+     * 开房时那个 pending 占位房间在被点亮之前，快照看起来一模一样，
+     * 误判会导致刚开好的房间被当成「已解散」拆掉，
+     * 表现就是「有时候挺快，有时候过一会儿就不更新了」。
+     */
+    private var hostRoomLost = false
 
     /** 主动关房后的静默截止时间 */
     private var suppressRoomClosedUntil = 0L
 
-    // ---------- 开房前的口令校验 ----------
-    // 流程是「先连播放器确认房间真实存在，再让后端开房」。
-    // 以前的顺序反了，口令失效时会先在后端开出一个幽灵房。
+    // ---------- 开房流程（并行：校验口令 + 后端占位同时发出）----------
+    // 顺序仍然是「先确认房间真实存在，再让后端开房」，只是不再串行等待：
+    // 后端那一路先挂一个对成员不可见的 pending 房间，口令校验通过后再点亮。
+    // 于是开房耗时 = max(两次往返) 而不是相加，省掉一整次跨境往返。
     private var isVerifyingSecret = false
     private var pendingRoomInfo: RoomInfo? = null
     private var verifyJob: Job? = null
 
-    // 房主端渲染用的是 Neri 回调的本地数据，零延迟
-    private var liveSongTitle: String? = null
-    private var liveArtist: String? = null
-    private var liveCoverUrl: String? = null
-    private var liveDurationMs = 0L
-    private var liveBasePosMs = 0L
-    private var liveAnchorAtMs = 0L
-    private var liveIsPlaying = false
-    private var livePlaybackRate = 1.0
+    /** 后端那次开房请求 */
+    private var startJob: Job? = null
+
+    /** 后端开房结果；null 表示请求还在途 */
+    private var startOutcome: StartOutcome? = null
+
+    /** 请求是否已经落地。它是「撤销占位房间」由哪一方负责的判据，见 cancelSecretVerification */
+    private var startSettled = true
+
+    /**
+     * 开房轮次。每次发起自增，用来作废上一轮还在途的请求 ——
+     * 否则一次迟到的结果会写进 startOutcome，被下一轮当成自己的结果读走
+     * （比如上一轮的「别人正在放歌」把新一次开房直接掐掉）。
+     */
+    private var startAttempt = 0
 
     // ---------- 任务 ----------
     private var bootstrapJob: Job? = null
-    private var hostKeepaliveJob: Job? = null
 
     // 全局顶部控件
     private lateinit var ivUserAvatar: ShapeableImageView
@@ -199,11 +212,14 @@ class MainActivity : AppCompatActivity() {
         tipManager = CapsuleTipManager(this)
         wasLoggedIn = sessionManager.isLoggedIn()
 
+        // HostSession 是进程级的，要在任何房主流程之前初始化好
+        HostSession.init(applicationContext)
+
         initViews()
         initWebViewSettings()
         initProgressTracker()
         initRealtime()
-        initNeriWatcher()
+        initNotificationPermission()
         setupListeners()
 
         renderInitialState()
@@ -212,6 +228,19 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+
+        // 重新附着到可能仍在跑的房主会话（Activity 重建、或从后台回来）。
+        // HostSession 是进程级的，所以这里是同步的，不存在「还没绑定好」的空窗。
+        // 必须重画一次当前状态，否则界面会一直空到下一次切歌为止。
+        HostSession.setListener(this)
+        if (HostSession.isHosting) {
+            // 只在真的在放歌时才画：校验阶段的缓存帧还不能代表「房间已上线」
+            HostSession.livePlayback?.let { renderLivePlayback(it) }
+        }
+        if (HostSession.consumeAuthExpired()) {
+            forceReLogin("登录状态已失效，请重新登录")
+        }
+
         connectRealtimeIfPossible()
     }
 
@@ -237,33 +266,35 @@ class MainActivity : AppCompatActivity() {
     override fun onStop() {
         super.onStop()
 
+        // 先摘订阅者再拆连接：保证拆的过程中不会有回调打到已经停下来的界面。
+        // 注意摘的只是「界面订阅」，房主会话本身照跑 —— 那是 HostSession 和
+        // MusicSyncService 的事，切后台正是它们要顶住的场景。
+        HostSession.setListener(null)
+
         // 实时通道只服务于前台画面，切后台断开省电。
         // 房主的状态上报走 HTTP，不受影响；而且服务端会强制把房主留在成员列表里。
         realtime.disconnect()
 
         progressTracker.pause()
 
-        // 校验校验到一半切后台：直接放弃本次校验，别留个半吊子状态
+        // 校验到一半切后台：直接放弃本次校验，别留个半吊子状态
         if (isVerifyingSecret) {
             cancelSecretVerification()
-        }
-
-        // 房主在放歌时，切到外部播放器切歌绝不能断开 Neri 长连接
-        if (!isHosting) {
-            neriWatcher.stopWatching()
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
 
-        // 刻意不在这里关房、也不清房主持久化记录：
-        // 转屏或 Activity 回收不该把正在放歌的房间打掉，
-        // 真正的兜底是服务端 90 秒心跳超时。
-        hostKeepaliveJob?.cancel()
+        // 刻意不在这里关房、不清房主记录、也不停 HostSession：
+        // 转屏或 Activity 回收不该把正在放歌的房间打掉 —— 开播期间有前台服务顶着，
+        // 真正的兜底是用户主动关播、服务端房间消失、或 90 秒心跳超时。
+        HostSession.setListener(null)
         bootstrapJob?.cancel()
         verifyJob?.cancel()
-        neriWatcher.stopWatching()
+        // 刻意不取消 startJob：onStop 已经用 abandonStartAttempt() 把它作废了，
+        // 而它必须能跑完才能自己撤销那个可能已经挂出去的占位房间。
+        // 直接 cancel 会让清理逻辑整段跳过，房间要等 30 秒 pending TTL 才回收。
         realtime.disconnect()
 
         (webHexLoader.parent as? ViewGroup)?.removeView(webHexLoader)
@@ -305,44 +336,110 @@ class MainActivity : AppCompatActivity() {
                 handleServerRoomClosed(reason, version)
             }
 
-            override fun onConnected() = Unit
+            override fun onConnected() {
+                // 通道恢复：把「连接不稳定」的标记撤掉
+                if (realtimeDown) {
+                    realtimeDown = false
+                    renderFromSnapshot()
+                }
+            }
 
             override fun onDisconnected(reason: String?) {
                 // 断线只影响新鲜度，绝不清空画面 —— 重连后会收到全量快照自动收敛。
                 // 清空才是「成员一会儿一个一会儿两个」那类抖动的来源。
                 if (reason == "登录状态已失效") {
                     forceReLogin("登录状态已失效，请重新登录")
+                    return
                 }
+                // 画面保持不动，但必须让用户知道「现在看到的可能已经过时了」，
+                // 而不是让一首已经切掉的歌继续显示成正在播放。
+                realtimeDown = true
+                renderFromSnapshot()
             }
         })
     }
 
-    private fun initNeriWatcher() {
-        neriWatcher = NeriRealtimeWatcher(
-            context = this,
-            onPlaybackUpdate = { songTitle, artist, coverUrl, durationMs, basePosMs, baseTimestampMs, playbackRate, isPlaying ->
-                onHostPlaybackUpdate(
-                    songTitle, artist, coverUrl, durationMs,
-                    basePosMs, playbackRate, isPlaying
-                )
-            },
-            onConnected = { onNeriConnected() },
-            onRoomClosed = {
-                // 只有房主会连 Neri，所以这里一定是「我自己的房间没了」
-                if (isVerifyingSecret) {
-                    // 校验阶段就失败 = 口令已失效，绝不能再去后端开房
-                    cancelSecretVerification()
-                    showTip("邀请口令已失效，房间已不存在")
-                } else if (isHosting) {
-                    // ⚠️ 必须通知后端。以前这里是 notifyServer = false，
-                    // 后端那条房间记录会一直挂到 90 秒心跳超时才回收；
-                    // 而这段时间服务端仍然声称「你正在放歌」，界面会被快照拽回去，
-                    // 看起来就是「房间关不掉」。
-                    stopHosting(notifyServer = true)
-                    showTip("房主已结束放歌")
-                }
+    /**
+     * API 33+ 的通知权限。
+     *
+     * 只在开播时才有必要问 —— 关掉也无所谓：前台服务照常运行，
+     * 只是通知栏里看不到那条常驻通知。所以绝不能拿它去挡开播流程。
+     */
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) {
+                showTip("未授予通知权限，后台同步仍会运行，但看不到状态通知")
             }
-        )
+        }
+
+    private fun initNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    // ==========================================================
+    // HostSession.Listener —— 房主会话事件（全部在主线程回调）
+    // ==========================================================
+
+    /** 房主端零延迟画面：直接吃 Neri 回调，不等服务端回声 */
+    override fun onLivePlayback(playback: LivePlayback) {
+        if (!HostSession.isHosting) return
+        renderLivePlayback(playback)
+    }
+
+    override fun onLiveCleared() {
+        if (!HostSession.isHosting) return
+        layoutAudioPlayerCard.isVisible = false
+        progressTracker.reset()
+        pbPlayerProgress.progress = 0
+    }
+
+    /** 口令校验通过 —— 这才轮到后端开房（后端那一路其实早就并行发出去了） */
+    override fun onVerifyConnected() {
+        if (!isVerifyingSecret) return
+        awaitStartOutcomeThenCommit()
+    }
+
+    override fun onVerifyRoomGone() {
+        if (!isVerifyingSecret) return
+        // 校验阶段就发现房间没了 = 口令已失效，绝不能再去后端开房
+        cancelSecretVerification()
+        showTip("邀请口令已失效，房间已不存在")
+    }
+
+    override fun onHostingStarted() {
+        hostReviveCount = 0
+        hostRoomLost = false
+        setPublishControlsEnabled(true, "开启")
+        showTip("房间上线成功！")
+    }
+
+    override fun onRoomLost() {
+        // 服务端确实没有我的房间了，这才允许走重挂
+        hostRoomLost = true
+    }
+
+    override fun onSessionStopped(reason: HostSession.StopReason) {
+        resetHostUi()
+
+        when (reason) {
+            HostSession.StopReason.TIMEOUT ->
+                showTip("后台同步已达系统时限，房间已自动关闭")
+            HostSession.StopReason.AUTH_EXPIRED ->
+                forceReLogin("登录状态已失效，请重新登录")
+            HostSession.StopReason.ROOM_CLOSED -> Unit   // 由 Neri 那条路径自己提示
+            HostSession.StopReason.SERVICE_GONE -> Unit
+            HostSession.StopReason.USER -> Unit
+        }
+    }
+
+    override fun onForegroundServiceUnavailable() {
+        showTip("系统未允许后台服务，切到后台可能掉线")
     }
 
     private fun initViews() {
@@ -439,6 +536,19 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // 一解析出合法口令就预热播放器连接。
+        // 用户粘完口令到真正点「开启」通常隔着一两秒，正好把那笔握手成本（实测最坏 5.7 秒）
+        // 提前付掉。HostSession 里做了幂等，同一个地址不会重复预热。
+        etInviteCode.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) = Unit
+            override fun afterTextChanged(s: Editable?) {
+                val info = NeriDeepLinkHelper.parseInvitation(s?.toString().orEmpty()) ?: return
+                if (info.roomId.isNullOrEmpty()) return
+                HostSession.preconnectNeri(info.serverUrl)
+            }
+        })
+
         btnJoin.setOnClickListener {
             if (!requireLogin()) return@setOnClickListener
 
@@ -523,6 +633,19 @@ class MainActivity : AppCompatActivity() {
         rosterJob?.cancel()
         rosterJob = null
 
+        // 开房流程的每一次在途请求也要收掉，否则换了身份之后
+        // 一个还在飞的 hostStart 会把房间挂到新账号头上
+        verifyJob?.cancel()
+        verifyJob = null
+        startJob = null
+        abandonStartAttempt()
+        pendingRoomInfo = null
+        isVerifyingSecret = false
+        isPublishing = false
+        isRevivingHost = false
+        hostReviveCount = 0
+        hostRoomLost = false
+
         roster.clear()
         rosterLoaded = false
         rosterError = null
@@ -530,6 +653,7 @@ class MainActivity : AppCompatActivity() {
 
         onlineQq = emptySet()
         hostQq = null
+        realtimeDown = false
         lastVersion = 0L
         snapshot = null
         hasRenderedOnce = false
@@ -608,7 +732,8 @@ class MainActivity : AppCompatActivity() {
         // 反过来的话，「我掉线、别人接管」的那一帧会拿服务端时间戳去套本机时基，
         // 进度条会整体偏移，要等到下一帧才被纠正。
         reconcileHosting(snap.room)
-        if (!isHosting) {
+        // 房主端的锚点时间戳来自本机 Neri 回调，是本机时基，不能再叠加服务器偏移
+        if (!HostSession.isHosting) {
             progressTracker.updateServerTime(snap.serverTime)
         }
 
@@ -679,7 +804,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         val meHosting = isMeHosting(room)
-        tvHostMessage.text = if (meHosting) "你正在放歌" else "${room.inviter ?: "群友"} 正在放歌"
+        val baseMessage = if (meHosting) "你正在放歌" else "${room.inviter ?: "群友"} 正在放歌"
+        // 掉线时画面照旧，但明确标出来 —— 用户至少知道该等一下，而不是以为切歌坏了
+        tvHostMessage.text = if (realtimeDown) "$baseMessage · 连接不稳定" else baseMessage
 
         renderPlayerCard(room, meHosting)
 
@@ -690,10 +817,39 @@ class MainActivity : AppCompatActivity() {
         layoutHostSection.isVisible = false
     }
 
+    /**
+     * 房主自己的画面：直接吃 Neri 回调，零延迟。
+     *
+     * 之所以不走服务端快照，是因为跨境的服务器回声会把刚跳到的新进度又拽回上一个锚点，
+     * 看起来就是「进度条慢半拍」。
+     */
+    private fun renderLivePlayback(playback: LivePlayback) {
+        layoutAudioPlayerCard.isVisible = true
+        tvPlayerSongTitle.text = playback.songTitle
+        tvPlayerArtist.text = playback.artist ?: "NeriPlayer"
+        tvPlayerSongTitle.isSelected = true
+        loadCircleImage(ivPlayerAlbumCover, playback.coverUrl)
+
+        progressTracker.useLocalClock()
+        progressTracker.updateMetrics(
+            durationMs = playback.durationMs,
+            basePositionMs = playback.basePosMs,
+            baseTimestampMs = playback.anchorAtMs,
+            playbackRate = playback.playbackRate,
+            isPlaying = playback.isPlaying
+        )
+
+        tvHostMessage.isVisible = true
+        tvHostMessage.text = "你正在放歌"
+        ivHostAvatar.isVisible = true
+        btnJoin.isVisible = false
+        layoutHostSection.isVisible = false
+    }
+
     private fun renderPlayerCard(room: ActiveRoom, meHosting: Boolean) {
         // 房主自己就是数据源，画面直接吃 Neri 回调。
         // 否则服务器回声会把刚跳到的新进度又拽回上一个锚点，看起来就是「进度条慢半拍」。
-        if (meHosting && isHosting && liveSongTitle != null) return
+        if (meHosting && HostSession.isHosting && HostSession.livePlayback != null) return
 
         val song = room.currentSong
         if (song.isNullOrBlank()) {
@@ -904,119 +1060,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ==========================================================
-    // 房主：状态上报
+    // 房主：与服务端对齐
     // ==========================================================
-
-    private fun onHostPlaybackUpdate(
-        songTitle: String?,
-        artist: String?,
-        coverUrl: String?,
-        durationMs: Long,
-        basePosMs: Long,
-        playbackRate: Double,
-        isPlaying: Boolean
-    ) {
-        // 校验阶段也要接收：join 响应里带的首帧状态必须缓存下来，
-        // 否则开房成功后要等到下一次切歌才有画面。
-        if (!isHosting && !isVerifyingSecret) return
-
-        if (songTitle.isNullOrBlank()) {
-            liveSongTitle = null
-            liveArtist = null
-            liveCoverUrl = null
-            liveDurationMs = 0L
-            liveBasePosMs = 0L
-            liveAnchorAtMs = 0L
-            liveIsPlaying = false
-            livePlaybackRate = 1.0
-
-            if (isHosting) {
-                layoutAudioPlayerCard.isVisible = false
-                progressTracker.reset()
-                pbPlayerProgress.progress = 0
-            }
-            return
-        }
-
-        liveSongTitle = songTitle
-        liveArtist = artist
-        liveCoverUrl = coverUrl
-        liveDurationMs = durationMs
-        liveBasePosMs = basePosMs
-        liveAnchorAtMs = System.currentTimeMillis()
-        liveIsPlaying = isPlaying
-        livePlaybackRate = playbackRate
-
-        // 校验阶段只缓存，画面与后端上报都等开房成功之后
-        if (!isHosting) return
-
-        // 房主自己的画面直接吃 Neri 回调，零延迟
-        layoutAudioPlayerCard.isVisible = true
-        tvPlayerSongTitle.text = songTitle
-        tvPlayerArtist.text = artist ?: "NeriPlayer"
-        tvPlayerSongTitle.isSelected = true
-        loadCircleImage(ivPlayerAlbumCover, coverUrl)
-
-        progressTracker.useLocalClock()
-        progressTracker.updateMetrics(
-            durationMs = durationMs,
-            basePositionMs = basePosMs,
-            baseTimestampMs = liveAnchorAtMs,
-            playbackRate = playbackRate,
-            isPlaying = isPlaying
-        )
-
-        pushHostState(includePlayback = true)
-    }
-
-    /** 房主本地的实时播放位置：锚点 + 已经过去的时间，保证上报给服务器的位置单调递增 */
-    private fun currentHostPositionMs(): Long {
-        if (!liveIsPlaying) return liveBasePosMs
-        val elapsed = System.currentTimeMillis() - liveAnchorAtMs
-        val position = liveBasePosMs + elapsed
-        return if (liveDurationMs > 0) position.coerceAtMost(liveDurationMs) else position
-    }
-
-    private fun pushHostState(includePlayback: Boolean) {
-        val token = sessionManager.getToken() ?: return
-        if (!isHosting) return
-
-        val title = liveSongTitle
-        val playback = if (includePlayback && !title.isNullOrEmpty()) {
-            PlaybackPayload(
-                currentSong = if (!liveArtist.isNullOrEmpty()) "$title - $liveArtist" else title,
-                currentCover = liveCoverUrl,
-                durationMs = liveDurationMs,
-                basePositionMs = currentHostPositionMs(),
-                isPlaying = liveIsPlaying
-            )
-        } else {
-            null
-        }
-
-        lifecycleScope.launch {
-            when (val outcome = api.hostPushState(token, playback)) {
-                PushOutcome.Ok -> touchHostingRecord()
-                PushOutcome.RoomLost -> {
-                    // 服务端已经没有我的房间了，交给下一轮 reconcile 去重挂
-                    Log.w(TAG, "服务端已无本房间，等待重新挂载")
-                }
-                PushOutcome.Unauthorized -> forceReLogin("登录状态已失效，请重新登录")
-                is PushOutcome.Failed -> Unit
-            }
-        }
-    }
-
-    private fun startHostKeepalive() {
-        if (hostKeepaliveJob?.isActive == true) return
-
-        hostKeepaliveJob = lifecycleScope.launch {
-            while (isActive && isHosting) {
-                delay(HOST_KEEPALIVE_INTERVAL_MS)
-                if (isHosting) pushHostState(includePlayback = true)
-            }
-        }
-    }
 
     /**
      * 把本地房主身份和服务端状态对齐：
@@ -1030,24 +1075,39 @@ class MainActivity : AppCompatActivity() {
         // （bootstrap 的 REST 快照 + 长连接握手的广播 + 其他人的连接抖动）。
         // 没有这个在途标记，每一条都会白白扣掉一次重试额度，
         // 三次之后就误判成「房间已解散」，把正在恢复的房间拆掉。
-        if (isPublishing || isRevivingHost) return
+        //
+        // isVerifyingSecret 同样关键：并行开房期间后端挂的是 pending 房间，
+        // 快照里 room 就是 null。不挡住的话，这里会拿着**上一次遗留的**房主记录
+        // 去重新 hostStart，把用户正在开的那个房间顶掉。
+        if (isPublishing || isVerifyingSecret || isRevivingHost) return
         val token = sessionManager.getToken() ?: return
 
         if (room != null) {
             if (isMeHosting(room)) {
                 adoptHostingIfNeeded()
-            } else if (isHosting) {
+            } else if (HostSession.isHosting) {
                 Log.i(TAG, "房间已被他人接管，放弃本地房主身份")
                 stopHosting(notifyServer = false)
             }
             return
         }
 
+        // 正在放歌，服务端快照却说没有房间 —— 别急着重挂。
+        //
+        // 开房时那个 pending 占位房间在确认之前，快照就是这样子的。把它当成
+        // 「房间掉了」会一路扣掉重挂额度，三次之后直接判定「房间已解散」并把
+        // 刚开好的会话拆掉。所以只有服务端明确说过没房间（RoomLost），
+        // 或者本地根本没在放歌，才轮到下面这条重挂路径。
+        if (HostSession.isHosting && !hostRoomLost) {
+            Log.i(TAG, "快照暂无房间，但本地仍在放歌（pending 点亮窗口），不重挂")
+            return
+        }
+
         // 服务端没有房间。房主记录只在「主动关房」或「确认解散」时才会被清掉，
         // 所以它还在就说明上次多半是被系统杀掉的，值得重挂。
-        val persisted = currentRoomInfo ?: restoreHostingRoom()
+        val persisted = HostSession.currentRoom ?: HostSession.restorePersistedRoom()
         if (persisted == null) {
-            if (isHosting) stopHosting(notifyServer = false)
+            if (HostSession.isHosting) stopHosting(notifyServer = false)
             return
         }
 
@@ -1057,18 +1117,29 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // 走到这里说明服务端确实没有我的房间了（hostRoomLost），或者本地本来就没在放歌。
+        // 前者要先把这个「已经没有对应房间」的本地会话收掉，否则 commitHosting 会
+        // 因为 isHosting 仍为 true 而直接返回，重挂等于没做。
+        //
+        // 注意这里是直接收 HostSession、而不是走 stopHosting()：stopHosting 会把
+        // hostReviveCount 清零，那重挂额度就永远攒不起来，房间彻底没了时会无限重挂。
+        if (HostSession.isHosting) {
+            Log.i(TAG, "服务端已无本房间，先收掉本地会话再重挂")
+            HostSession.stop(
+                notifyServer = false,
+                reason = HostSession.StopReason.ROOM_CLOSED
+            )
+        }
+
         hostReviveCount++
+        hostRoomLost = false
         isRevivingHost = true
         Log.i(TAG, "服务端无房间，重新挂载（第 $hostReviveCount 次）")
 
         lifecycleScope.launch {
             try {
                 when (val outcome = api.hostStart(token, persisted)) {
-                    is StartOutcome.Ok -> {
-                        currentRoomInfo = persisted
-                        persistHostingRoom(persisted)
-                        adoptHostingIfNeeded()
-                    }
+                    is StartOutcome.Ok -> adoptHostingIfNeeded(persisted)
                     is StartOutcome.Conflict -> {
                         stopHosting(notifyServer = false)
                         showTip(outcome.message)
@@ -1087,17 +1158,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 服务端确认我是房主，但本地还没在放歌 —— 把 Neri 长连接和保活循环接回来 */
-    private fun adoptHostingIfNeeded() {
-        if (isHosting) return
+    /**
+     * 服务端确认我是房主，但本地还没在放歌 —— 把会话接回来。
+     *
+     * 注意这条路必须走 [HostSession.commitHosting]：进程被系统杀掉后重新挂载时，
+     * 前台服务也要跟着起来。只置个本地标志位的话，就变成「房间活着但没有前台服务顶着」，
+     * 划掉 App 照样掉线 —— 那正是这次要修的问题。
+     */
+    private fun adoptHostingIfNeeded(info: RoomInfo? = null) {
+        if (HostSession.isHosting) return
 
-        val persisted = currentRoomInfo ?: restoreHostingRoom() ?: return
+        val persisted = info ?: HostSession.currentRoom ?: HostSession.restorePersistedRoom() ?: return
         Log.i(TAG, "接管回房主身份 roomId=${persisted.roomId}")
-
-        isHosting = true
-        currentRoomInfo = persisted
-        startNeriWatcher(persisted)
-        startHostKeepalive()
+        HostSession.commitHosting(persisted)
     }
 
     private fun handleServerRoomClosed(reason: String, version: Long) {
@@ -1105,7 +1178,7 @@ class MainActivity : AppCompatActivity() {
         // 通过排序检查，把刚关掉的房间又画回来。
         if (version > lastVersion) lastVersion = version
 
-        val wasHosting = isHosting
+        val wasHosting = HostSession.isHosting
         stopHosting(notifyServer = false)
 
         snapshot = snapshot?.copy(room = null)
@@ -1121,6 +1194,8 @@ class MainActivity : AppCompatActivity() {
             wasHosting && reason == "timeout" -> showTip("房间长时间无响应，已自动关闭")
             // 后端主动探测到播放器里的房间已经没了
             wasHosting && reason == "room_gone" -> showTip("播放器里的房间已结束，已自动关房")
+            // 并行开房时的占位房间一直没等到确认，多半是客户端半路走了
+            reason == "pending_timeout" -> Unit
             wasHosting -> Unit
             else -> showTip("房主已结束放歌")
         }
@@ -1148,19 +1223,59 @@ class MainActivity : AppCompatActivity() {
             showTip("口令格式错误：未解析到合法的6位房间号或密钥！")
             return
         }
-        if (isPublishing || isVerifyingSecret) return
+        // HostSession.isActive 也要挡：Activity 这一侧的标志位在重建后可能都归零，
+        // 但会话其实还在跑。漏掉它就会对同一个房间再发一次 hostStart。
+        if (isPublishing || isVerifyingSecret || HostSession.isActive) return
 
-        if (sessionManager.getToken().isNullOrEmpty()) {
+        val token = sessionManager.getToken()
+        if (token.isNullOrEmpty()) {
             showTip("请先登录")
             return
         }
 
         isVerifyingSecret = true
         pendingRoomInfo = info
+        startOutcome = null
+        startSettled = false
         setPublishControlsEnabled(false, "校验中...")
         showTip("正在校验邀请口令...")
 
-        startNeriWatcher(info)
+        // 两路并行发出，开房耗时 = max(两者) 而不是相加 —— 跨境链路上省掉一整次往返：
+        //   ① 连播放器 join，确认口令有效、房间真实存在；
+        //   ② 后端先挂一个 pending 房间，它对成员端完全不可见，等 ① 通过后再点亮。
+        // 「先验证再开房」的顺序没有被破坏：① 成功之前，成员端什么都看不到。
+        HostSession.beginVerification(info)
+        val attempt = ++startAttempt
+        startJob = lifecycleScope.launch {
+            val outcome = api.hostStart(token, info, pending = true)
+
+            if (attempt != startAttempt) {
+                // 这一轮已经作废（被取消 / 用户重新开了一次 / 已登出）。
+                // 房间可能已经建出来了，就地撤掉 —— 放在这里做是刻意的：
+                // 此刻 hostStart 一定已经返回，撤销不可能抢在它前面到达，
+                // 也就不会出现「撤销落空、占位房间残留」。
+                if (outcome is StartOutcome.Ok) {
+                    Log.i(TAG, "本轮开房已作废，撤销占位房间")
+                    api.hostStop(token)
+                }
+                return@launch
+            }
+
+            startSettled = true
+            startOutcome = outcome
+
+            // 后端明确拒绝（比如别人正在放歌），不必再干等口令校验
+            if (outcome !is StartOutcome.Ok && isVerifyingSecret) {
+                cancelSecretVerification()
+                when (outcome) {
+                    is StartOutcome.Conflict -> showTip(outcome.message)
+                    StartOutcome.Unauthorized -> forceReLogin("登录状态已失效，请重新登录")
+                    is StartOutcome.Failed -> showTip(outcome.message ?: "开启失败")
+                    else -> Unit
+                }
+                renderFromSnapshot()
+            }
+        }
 
         verifyJob?.cancel()
         verifyJob = lifecycleScope.launch {
@@ -1172,13 +1287,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Neri 确认 join 成功：口令有效，这才轮到后端开房 */
-    private fun onNeriConnected() {
-        if (!isVerifyingSecret) return
+    /**
+     * 口令校验通过（[HostSession.Listener.onVerifyConnected] 触发）：
+     * 房间确实存在，现在把后端那一路的结果接上。
+     *
+     * 后端请求是并行发出的，可能已经回来了，也可能还在飞 —— 这里等它落地。
+     * 等的是「较慢的那一路」，所以总耗时仍然是一次往返，而不是两次相加。
+     */
+    private fun awaitStartOutcomeThenCommit() {
+        // Neri 在弱网下可能重复报 join 成功，别把收尾流程跑两遍
+        if (isPublishing || HostSession.isHosting) return
 
         val info = pendingRoomInfo
-        val token = sessionManager.getToken()
-        if (info == null || token.isNullOrEmpty()) {
+        if (info == null || sessionManager.getToken().isNullOrEmpty()) {
             cancelSecretVerification()
             showTip("请先登录")
             return
@@ -1186,17 +1307,23 @@ class MainActivity : AppCompatActivity() {
 
         verifyJob?.cancel()
         verifyJob = null
-        isVerifyingSecret = false
         isPublishing = true
         setPublishControlsEnabled(false, "开启中...")
 
         lifecycleScope.launch {
-            val outcome = api.hostStart(token, info)
+            startJob?.join()
+
+            val outcome = startOutcome
+            startOutcome = null
             isPublishing = false
             setPublishControlsEnabled(true, "开启")
 
+            // 等结果的过程中被取消了（切后台 / 超时），别再往下走
+            if (!isVerifyingSecret || HostSession.isHosting) return@launch
+            isVerifyingSecret = false
+
             when (outcome) {
-                is StartOutcome.Ok -> onHostingStarted(info, outcome.room)
+                is StartOutcome.Ok -> onHostingStarted(info)
 
                 // 后面这几种都是「没开成」，Neri 那条连接必须收掉，否则会一直挂着
                 is StartOutcome.Conflict -> {
@@ -1213,115 +1340,116 @@ class MainActivity : AppCompatActivity() {
                     showTip(outcome.message ?: "开启失败")
                     renderFromSnapshot()
                 }
+                null -> {
+                    abandonPendingRoom()
+                    showTip("开启失败，请重试")
+                    renderFromSnapshot()
+                }
             }
         }
     }
 
-    /** 口令校验失败或超时：收掉 Neri 连接、恢复按钮，绝不碰后端 */
+    /**
+     * 口令校验失败或超时：收掉 Neri 连接、恢复按钮。
+     *
+     * 后端那一路是并行发出的，可能已经挂出了一个 pending 房间，得撤销。撤销分两半，
+     * 靠 [startSettled] 判别、恰好有一方命中：
+     *  - 请求已落地 → 这里直接 hostStop（此刻房间一定存在，不存在抢跑的竞态）；
+     *  - 请求还在途 → 交给 startJob 落地时自己清理（见上面的轮次判断）。
+     * 万一进程在中途被杀，服务端还有 30 秒的 pending TTL 兜底 —— 反正它对成员不可见。
+     */
     private fun cancelSecretVerification() {
         verifyJob?.cancel()
         verifyJob = null
         isVerifyingSecret = false
+        isPublishing = false
         pendingRoomInfo = null
-        neriWatcher.stopWatching()
+        HostSession.cancelVerification()
         setPublishControlsEnabled(true, "开启")
+        abandonStartAttempt()
+    }
+
+    /**
+     * 作废当前这一轮开房，并确保那个可能已经挂出去的占位房间有人负责撤销。
+     *
+     * 顺序要紧：先按**当前**这一轮的结果决定撤不撤，再让轮次作废。
+     * 反过来的话，在途请求会被判成「作废」而自行撤销，而这里又读着上一轮的残留
+     * 结果再撤一次 —— 两边都以为对方在处理。
+     */
+    private fun abandonStartAttempt() {
+        if (startSettled && startOutcome is StartOutcome.Ok) {
+            sessionManager.getToken()?.let { token ->
+                lifecycleScope.launch { api.hostStop(token) }
+            }
+        }
+
+        // 还在途的那一次：轮次一变，它落地时就会自己 hostStop 掉
+        startAttempt++
+        startSettled = false
+        startOutcome = null
     }
 
     /** 后端没接受这次开房，把已经建立的 Neri 连接收干净 */
     private fun abandonPendingRoom() {
         pendingRoomInfo = null
-        neriWatcher.stopWatching()
+        HostSession.cancelVerification()
     }
 
-    private fun onHostingStarted(info: RoomInfo, room: ActiveRoom?) {
+    private fun onHostingStarted(info: RoomInfo) {
         hostReviveCount = 0
-        isHosting = true
-        currentRoomInfo = info
         pendingRoomInfo = null
-
-        persistHostingRoom(info)
+        isVerifyingSecret = false
         etInviteCode.setText("")
-        setPublishControlsEnabled(true, "开启")
 
-        // 幂等：校验阶段就已经连上了，这里不会重复建连
-        startNeriWatcher(info)
-        startHostKeepalive()
-
-        // 校验阶段缓存下来的首帧现在补上，否则要等到下一次切歌才有画面
-        replayCachedPlayback()
-
-        room?.let { renderRoom(it) }
-        showTip("房间上线成功！")
+        // 进入放歌：复用校验阶段那条 Neri 连接，拉起保活循环和前台服务。
+        // 校验阶段缓存的首帧会在这里一并发给服务端（confirm），
+        // 那个 pending 占位房间也就此对成员可见。
+        HostSession.commitHosting(info)
     }
 
-    /** 把校验阶段从 join 响应里拿到的首帧播放状态补画出来并上报给后端 */
-    private fun replayCachedPlayback() {
-        val title = liveSongTitle ?: return
+    /**
+     * 关播收口。所有退出路径（用户关播、登出、token 失效、服务端关房）都走这里 ——
+     * 只有一处收口才不会漏掉某个入口把前台服务留在那里。
+     */
+    private fun stopHosting(notifyServer: Boolean) {
+        val wasActive = HostSession.isActive
 
-        layoutAudioPlayerCard.isVisible = true
-        tvPlayerSongTitle.text = title
-        tvPlayerArtist.text = liveArtist ?: "NeriPlayer"
-        tvPlayerSongTitle.isSelected = true
-        loadCircleImage(ivPlayerAlbumCover, liveCoverUrl)
-
-        if (liveDurationMs > 0) {
-            progressTracker.useLocalClock()
-            progressTracker.updateMetrics(
-                durationMs = liveDurationMs,
-                basePositionMs = liveBasePosMs,
-                baseTimestampMs = liveAnchorAtMs,
-                playbackRate = livePlaybackRate,
-                isPlaying = liveIsPlaying
-            )
+        if (wasActive && notifyServer) {
+            suppressRoomClosedUntil = System.currentTimeMillis() + ROOM_CLOSED_SUPPRESS_MS
         }
 
-        pushHostState(includePlayback = true)
-    }
-
-    private fun stopHosting(notifyServer: Boolean) {
-        val wasHosting = isHosting
-
-        isHosting = false
-        isVerifyingSecret = false
         verifyJob?.cancel()
         verifyJob = null
+        startJob = null
+        abandonStartAttempt()
         pendingRoomInfo = null
+        isVerifyingSecret = false
+        isPublishing = false
         hostReviveCount = 0
-        hostKeepaliveJob?.cancel()
-        hostKeepaliveJob = null
-        neriWatcher.stopWatching()
-        currentRoomInfo = null
-        sessionManager.clearHostingRoom()
+        hostRoomLost = false
 
-        liveSongTitle = null
-        liveArtist = null
-        liveCoverUrl = null
-        liveDurationMs = 0L
-        liveBasePosMs = 0L
-        liveAnchorAtMs = 0L
-        liveIsPlaying = false
-        livePlaybackRate = 1.0
+        HostSession.stop(
+            notifyServer = notifyServer,
+            reason = if (notifyServer) HostSession.StopReason.USER
+            else HostSession.StopReason.ROOM_CLOSED
+        )
 
-        if (wasHosting && notifyServer) {
-            suppressRoomClosedUntil = System.currentTimeMillis() + ROOM_CLOSED_SUPPRESS_MS
-            val token = sessionManager.getToken()
-            if (token != null) {
-                lifecycleScope.launch { api.hostStop(token) }
-            }
-        }
+        // 立刻把画面收回到「空闲」，不等跨境的 room_closed 回声；
+        // 随后到达的权威快照会确认同一件事。
+        snapshot = snapshot?.copy(room = null)
+        hostQq = null
+        resetHostUi()
+        renderRoom(null)
+        refreshMembersTab()
     }
 
-    private fun startNeriWatcher(info: RoomInfo) {
-        val roomId = info.roomId ?: return
-        val secret = info.secret ?: return
-        if (roomId.isEmpty() || secret.isEmpty()) return
-
-        neriWatcher.startWatching(
-            info.serverUrl ?: ApiConfig.DEFAULT_NERI_SERVER,
-            roomId,
-            secret,
-            sessionManager.getUsername()
-        )
+    /** 会话结束后回收「房主专属」的界面状态 */
+    private fun resetHostUi() {
+        etInviteCode.setText("")
+        setPublishControlsEnabled(true, "开启")
+        layoutAudioPlayerCard.isVisible = false
+        progressTracker.reset()
+        pbPlayerProgress.progress = 0
     }
 
     private fun setPublishControlsEnabled(enabled: Boolean, text: String) {
@@ -1331,69 +1459,9 @@ class MainActivity : AppCompatActivity() {
         etInviteCode.isEnabled = enabled
     }
 
-    // ==========================================================
-    // 房主身份持久化
-    // ==========================================================
-
-    private fun persistHostingRoom(info: RoomInfo) {
-        val json = JSONObject().apply {
-            put("ownerQq", sessionManager.getQq())
-            put("owner", sessionManager.getUsername())
-            put("roomId", info.roomId ?: "")
-            put("secret", info.secret ?: "")
-            put("deepLink", info.rawUri)
-            put("serverUrl", info.serverUrl ?: ApiConfig.DEFAULT_NERI_SERVER)
-            put("inviter", info.inviter ?: "")
-            put("savedAt", System.currentTimeMillis())
-        }
-        lastRecordRefreshAt = System.currentTimeMillis()
-        sessionManager.saveHostingRoom(json.toString())
-    }
-
-    /** 房主还在正常放歌时定期把记录的时间戳续上，否则它会在 30 分钟后过期 */
-    private fun touchHostingRecord() {
-        val now = System.currentTimeMillis()
-        if (now - lastRecordRefreshAt < RECORD_REFRESH_INTERVAL_MS) return
-        currentRoomInfo?.let { persistHostingRoom(it) }
-    }
-
-    private fun restoreHostingRoom(): RoomInfo? {
-        val raw = sessionManager.getHostingRoom() ?: return null
-
-        return try {
-            val json = JSONObject(raw)
-
-            // 换了账号登录，旧的房主身份必须作废。
-            // 用 qq 而不是昵称比对 —— 昵称是可以随时改的，改了不该把房间丢掉。
-            val ownerQq = json.optString("ownerQq", "")
-            val myQq = sessionManager.getQq()
-            if (ownerQq.isNotEmpty() && myQq.isNotEmpty() && ownerQq != myQq) {
-                sessionManager.clearHostingRoom()
-                return null
-            }
-
-            // 过期记录直接作废，别在第二天打开 App 时凭空拉起一个僵尸房间
-            val savedAt = json.optLong("savedAt", 0L)
-            if (savedAt > 0 && System.currentTimeMillis() - savedAt > HOST_RECORD_MAX_AGE_MS) {
-                Log.i(TAG, "房主记录已过期，作废")
-                sessionManager.clearHostingRoom()
-                return null
-            }
-
-            val roomId = json.optString("roomId", "")
-            if (roomId.isEmpty()) return null
-
-            RoomInfo(
-                rawUri = json.optString("deepLink", ""),
-                roomId = roomId,
-                inviter = json.optString("inviter", "").ifEmpty { null },
-                secret = json.optString("secret", "").ifEmpty { null },
-                serverUrl = json.optString("serverUrl", "").ifEmpty { null }
-            )
-        } catch (_: Exception) {
-            null
-        }
-    }
+    // 房主身份持久化（persistHostingRoom / touchHostingRecord / restoreHostingRoom）
+    // 已经整体搬进 HostSession —— 它必须活过 Activity 销毁，否则进程被杀之后
+    // 就没有依据把房间重新挂回来了。对外只需要 HostSession.restorePersistedRoom()。
 
     // ==========================================================
     // 视图工具
@@ -1455,7 +1523,7 @@ class MainActivity : AppCompatActivity() {
     private fun verifyAndJoinRoom(link: String) {
         val launched = NeriDeepLinkHelper.launchPlayer(this@MainActivity, link)
         if (!launched) {
-            showTip("未找到 NeriPlayer，请确认已安装！")
+            showTip("未安装 NeriPlayer")
         }
     }
     private fun updateUserUi() {
