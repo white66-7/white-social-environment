@@ -317,13 +317,8 @@ object HostSession {
         verifying = false
         hosting = false
 
-        keepaliveJob?.cancel()
-        keepaliveJob = null
-        pusher?.stop()
-        pusher = null
+        teardownSessionWork()
         watcher?.stopWatching()
-        sessionScope?.cancel()
-        sessionScope = null
 
         room = null
         live = null
@@ -341,6 +336,53 @@ object HostSession {
         hooks?.onExitForeground()
         stopForegroundService()
         listener?.onSessionStopped(reason)
+    }
+
+    /** 拆掉会话内的后台工作（保活、推送、会话作用域）。不碰房间和播放状态。 */
+    private fun teardownSessionWork() {
+        keepaliveJob?.cancel()
+        keepaliveJob = null
+        pusher?.stop()
+        pusher = null
+        sessionScope?.cancel()
+        sessionScope = null
+    }
+
+    /**
+     * 重新挂载到同一个房间，但**保留**当前播放状态。
+     *
+     * 和 [stop] 的区别是关键：[stop] 会把 [live] 清空，而重挂时歌还在放 ——
+     * 服务端丢的只是那条房间记录，本地播放状态一点没失效。
+     *
+     * 清掉它的后果很隐蔽但很致命：房间重新上线后是**没有歌**的，而 NeriPlayer
+     * 只在状态**变化**时才推，所以没有任何东西会把这歌补回来 ——
+     * 用户会一直看到「你正在放歌」却不见歌曲，直到自己手动切一首。
+     *
+     * 也不重连 Neri：那条长连接是连**播放器**的，跟后端这条房间记录没关系，
+     * 全程都是好的。停掉再连只会白白多一次 1~7 秒的 join。
+     */
+    @MainThread
+    fun reattach(info: RoomInfo) {
+        val ctx = appContext ?: return
+
+        room = info
+        verifying = false
+        hosting = true
+
+        // 幂等：同房间同连接时直接返回，不会重复 join
+        startWatcher(info)
+        persistRoom(info)
+
+        if (sessionScope == null) {
+            // 会话工作之前被拆掉了（比如服务被系统回收过），整套补起来
+            startSessionWork()
+        } else {
+            startForegroundService()
+        }
+
+        // 立刻把当前这首歌推上去：房间一上线就有画面，不用干等 Neri 的下一次事件
+        confirmToServer()
+        listener?.onHostingStarted()
     }
 
     /**

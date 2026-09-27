@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -41,9 +42,25 @@ class MusicSyncService : Service(), HostSession.ServiceHooks {
 
         /** 通知栏上的「停止放歌」 */
         const val ACTION_STOP = "com.example.social_music.action.STOP_HOSTING"
+
+        /**
+         * 唤醒锁的兜底超时。取和系统 dataSync 前台服务同一个量级（6 小时），
+         * 就算哪里漏了释放也不会一直耗电。
+         */
+        private const val WAKE_LOCK_TIMEOUT_MS = 6 * 60 * 60 * 1000L
     }
 
     private var foregroundStarted = false
+
+    /**
+     * 息屏期间保住 CPU。
+     *
+     * 保活循环是协程里的 `delay(20_000)`，而它基于 SystemClock.uptimeMillis ——
+     * **设备深睡时这个时钟停止推进**，于是 20 秒的间隔在墙上时间会被拉长到几分钟，
+     * 服务端 90 秒收不到上报就把房间关了。前台服务能保住进程，但保不住 CPU 时钟，
+     * 这两件事是分开的。所以必须在开播期间持有这把锁。
+     */
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -93,6 +110,7 @@ class MusicSyncService : Service(), HostSession.ServiceHooks {
     }
 
     override fun onDestroy() {
+        releaseWakeLock()
         HostSession.bindHooks(null)
 
         // 防御：服务被系统或用户干掉时，别留下一个还在跑会话却没有前台服务的状态 ——
@@ -138,13 +156,36 @@ class MusicSyncService : Service(), HostSession.ServiceHooks {
             startForeground(NOTIF_ID, notification)
         }
         foregroundStarted = true
+
+        // 前台服务一建立就把 CPU 锁上，息屏后保活才能按点跑
+        acquireWakeLock()
     }
 
     private fun exitForeground() {
+        releaseWakeLock()
         // minSdk 24，STOP_FOREGROUND_REMOVE 一直可用
         stopForeground(STOP_FOREGROUND_REMOVE)
         foregroundStarted = false
         stopSelf()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        val pm = getSystemService(PowerManager::class.java) ?: return
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "social_music:hosting").apply {
+            // 关播时显式释放，所以不要引用计数
+            setReferenceCounted(false)
+            acquire(WAKE_LOCK_TIMEOUT_MS)
+        }
+        Log.i(TAG, "已持有唤醒锁，息屏后保活不会被系统睡眠拖慢")
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { lock ->
+            if (lock.isHeld) lock.release()
+            Log.i(TAG, "已释放唤醒锁")
+        }
+        wakeLock = null
     }
 
     private fun notifySafely(notification: Notification) {

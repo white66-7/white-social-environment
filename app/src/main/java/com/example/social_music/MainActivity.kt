@@ -1118,19 +1118,11 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
         }
 
         // 走到这里说明服务端确实没有我的房间了（hostRoomLost），或者本地本来就没在放歌。
-        // 前者要先把这个「已经没有对应房间」的本地会话收掉，否则 commitHosting 会
-        // 因为 isHosting 仍为 true 而直接返回，重挂等于没做。
         //
-        // 注意这里是直接收 HostSession、而不是走 stopHosting()：stopHosting 会把
-        // hostReviveCount 清零，那重挂额度就永远攒不起来，房间彻底没了时会无限重挂。
-        if (HostSession.isHosting) {
-            Log.i(TAG, "服务端已无本房间，先收掉本地会话再重挂")
-            HostSession.stop(
-                notifyServer = false,
-                reason = HostSession.StopReason.ROOM_CLOSED
-            )
-        }
-
+        // 这里刻意**不**先把会话停掉。之前是 stop() 完再 commitHosting()，而 stop() 会
+        // 清空缓存的播放状态，于是重挂出来的房间是没有歌的 —— 而 NeriPlayer 只在状态
+        // 变化时才推，没有任何东西会把歌补回来，用户就一直看着「你正在放歌」却没有歌曲。
+        // 改成重挂成功后直接 reattach，播放状态原样带过去。
         hostReviveCount++
         hostRoomLost = false
         isRevivingHost = true
@@ -1139,7 +1131,9 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
         lifecycleScope.launch {
             try {
                 when (val outcome = api.hostStart(token, persisted)) {
-                    is StartOutcome.Ok -> adoptHostingIfNeeded(persisted)
+                    // reattach 而不是 commitHosting：后者只在全新会话时用。
+                    // 重挂要保留本地播放状态，否则房间回来是空的（见 reattach 的注释）。
+                    is StartOutcome.Ok -> HostSession.reattach(persisted)
                     is StartOutcome.Conflict -> {
                         stopHosting(notifyServer = false)
                         showTip(outcome.message)

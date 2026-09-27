@@ -235,12 +235,14 @@ class NeriRealtimeWatcher(
 
                     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                         if (myGeneration != generation || isClosedManually) return
+                        forgetSocket(webSocket, myGeneration)
                         Log.w(TAG, "长连接已关闭(code=$code)，先确认房间是否还在")
                         probeRoomThenRecover(serverUrl, roomId, secret, userNickname, myGeneration)
                     }
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                         if (myGeneration != generation || isClosedManually) return
+                        forgetSocket(webSocket, myGeneration)
                         Log.w(TAG, "WebSocket 波动异常: ${t.message}")
                         // 404/410 = 房间已经没了，重连多少次都没用
                         if (response?.code in listOf(404, 410)) {
@@ -269,6 +271,25 @@ class NeriRealtimeWatcher(
                 }
             }
         }.start()
+    }
+
+    /**
+     * 连接已经死了：把引用清掉。
+     *
+     * 这一步绝不能省。[startWatching] 的幂等判断是
+     * 「同一个房间号 && activeWebSocket != null → 直接返回」，
+     * 而 OkHttp 在 onClosed / onFailure 之后**不会**帮我们把这个引用置空。
+     *
+     * 结果就是：长连接一掉线，重连请求会被自己的幂等判断挡回去 ——
+     * 连接永远不再建立，切歌事件从此再也收不到，而且**再也不会自己好**。
+     * 以前 Activity 销毁时会 stopWatching() 顺手清掉它，等于把一个 bug 兜住了；
+     * 现在会话要活过 Activity，这个兜底就没有了，必须在这里显式清。
+     */
+    @Synchronized
+    private fun forgetSocket(dead: WebSocket, myGeneration: Int) {
+        if (myGeneration != generation) return
+        // 只清自己那一条，别把新一代的连接误伤掉
+        if (activeWebSocket === dead) activeWebSocket = null
     }
 
     /**

@@ -9,6 +9,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- API 33+ 显示通知栏需要；用户拒绝时前台服务照常运行，只是通知不可见 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!--
+      开播期间持有 PARTIAL_WAKE_LOCK。
+      协程的 delay() 走的是 SystemClock.uptimeMillis，设备深度睡眠时它**不走** ——
+      没有这个锁，息屏后 20 秒一次的保活循环在墙上时间里会拖成好几分钟一次，
+      服务端 90 秒收不到心跳就把房间回收了。这正是「息屏后回来房间没了」的根因。
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- 适配 Android 11+ 包可见性规则，允许检测并跳转 NeriPlayer -->
     <queries>
