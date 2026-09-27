@@ -76,6 +76,13 @@ class MainActivity : AppCompatActivity() {
 
         /** 主动关房后的静默窗口，用来吞掉自己触发的那条 room_closed 提示 */
         private const val ROOM_CLOSED_SUPPRESS_MS = 5_000L
+
+        /**
+         * 校验邀请口令的超时时间。
+         * 超过这么久播放器服务器还没确认 join 成功，就认为口令已失效或服务不可达，
+         * 直接放弃开房 —— 绝不在后端留下一个指向不存在房间的幽灵房。
+         */
+        private const val SECRET_VERIFY_TIMEOUT_MS = 12_000L
     }
 
     // ---------- 依赖 ----------
@@ -123,6 +130,13 @@ class MainActivity : AppCompatActivity() {
     /** 主动关房后的静默截止时间 */
     private var suppressRoomClosedUntil = 0L
 
+    // ---------- 开房前的口令校验 ----------
+    // 流程是「先连播放器确认房间真实存在，再让后端开房」。
+    // 以前的顺序反了，口令失效时会先在后端开出一个幽灵房。
+    private var isVerifyingSecret = false
+    private var pendingRoomInfo: RoomInfo? = null
+    private var verifyJob: Job? = null
+
     // 房主端渲染用的是 Neri 回调的本地数据，零延迟
     private var liveSongTitle: String? = null
     private var liveArtist: String? = null
@@ -131,6 +145,7 @@ class MainActivity : AppCompatActivity() {
     private var liveBasePosMs = 0L
     private var liveAnchorAtMs = 0L
     private var liveIsPlaying = false
+    private var livePlaybackRate = 1.0
 
     // ---------- 任务 ----------
     private var bootstrapJob: Job? = null
@@ -228,6 +243,11 @@ class MainActivity : AppCompatActivity() {
 
         progressTracker.pause()
 
+        // 校验校验到一半切后台：直接放弃本次校验，别留个半吊子状态
+        if (isVerifyingSecret) {
+            cancelSecretVerification()
+        }
+
         // 房主在放歌时，切到外部播放器切歌绝不能断开 Neri 长连接
         if (!isHosting) {
             neriWatcher.stopWatching()
@@ -242,6 +262,7 @@ class MainActivity : AppCompatActivity() {
         // 真正的兜底是服务端 90 秒心跳超时。
         hostKeepaliveJob?.cancel()
         bootstrapJob?.cancel()
+        verifyJob?.cancel()
         neriWatcher.stopWatching()
         realtime.disconnect()
 
@@ -305,10 +326,19 @@ class MainActivity : AppCompatActivity() {
                     basePosMs, playbackRate, isPlaying
                 )
             },
+            onConnected = { onNeriConnected() },
             onRoomClosed = {
                 // 只有房主会连 Neri，所以这里一定是「我自己的房间没了」
-                if (isHosting) {
-                    stopHosting(notifyServer = false)
+                if (isVerifyingSecret) {
+                    // 校验阶段就失败 = 口令已失效，绝不能再去后端开房
+                    cancelSecretVerification()
+                    showTip("邀请口令已失效，房间已不存在")
+                } else if (isHosting) {
+                    // ⚠️ 必须通知后端。以前这里是 notifyServer = false，
+                    // 后端那条房间记录会一直挂到 90 秒心跳超时才回收；
+                    // 而这段时间服务端仍然声称「你正在放歌」，界面会被快照拽回去，
+                    // 看起来就是「房间关不掉」。
+                    stopHosting(notifyServer = true)
                     showTip("房主已结束放歌")
                 }
             }
@@ -886,7 +916,9 @@ class MainActivity : AppCompatActivity() {
         playbackRate: Double,
         isPlaying: Boolean
     ) {
-        if (!isHosting) return
+        // 校验阶段也要接收：join 响应里带的首帧状态必须缓存下来，
+        // 否则开房成功后要等到下一次切歌才有画面。
+        if (!isHosting && !isVerifyingSecret) return
 
         if (songTitle.isNullOrBlank()) {
             liveSongTitle = null
@@ -896,10 +928,13 @@ class MainActivity : AppCompatActivity() {
             liveBasePosMs = 0L
             liveAnchorAtMs = 0L
             liveIsPlaying = false
+            livePlaybackRate = 1.0
 
-            layoutAudioPlayerCard.isVisible = false
-            progressTracker.reset()
-            pbPlayerProgress.progress = 0
+            if (isHosting) {
+                layoutAudioPlayerCard.isVisible = false
+                progressTracker.reset()
+                pbPlayerProgress.progress = 0
+            }
             return
         }
 
@@ -910,6 +945,10 @@ class MainActivity : AppCompatActivity() {
         liveBasePosMs = basePosMs
         liveAnchorAtMs = System.currentTimeMillis()
         liveIsPlaying = isPlaying
+        livePlaybackRate = playbackRate
+
+        // 校验阶段只缓存，画面与后端上报都等开房成功之后
+        if (!isHosting) return
 
         // 房主自己的画面直接吃 Neri 回调，零延迟
         layoutAudioPlayerCard.isVisible = true
@@ -1080,6 +1119,8 @@ class MainActivity : AppCompatActivity() {
 
         when {
             wasHosting && reason == "timeout" -> showTip("房间长时间无响应，已自动关闭")
+            // 后端主动探测到播放器里的房间已经没了
+            wasHosting && reason == "room_gone" -> showTip("播放器里的房间已结束，已自动关房")
             wasHosting -> Unit
             else -> showTip("房主已结束放歌")
         }
@@ -1089,6 +1130,16 @@ class MainActivity : AppCompatActivity() {
     // 房主：开播 / 关播
     // ==========================================================
 
+    /**
+     * 开房第一步：先去播放器服务器验证口令。
+     *
+     * 顺序很关键。以前是「直接让后端开房，再慢慢去连播放器」，于是粘一个过期的
+     * 邀请链接也会在后端开出一个指向**已不存在的 Neri 房间**的幽灵房 ——
+     * 成员看得到、房主自己又满世界找不到关掉它的入口。
+     *
+     * 现在只有 join 成功（也就是口令真的有效、房间真的还在）才会去调后端开房。
+     * 校验用的就是房主本来就该建立的那条 Neri 长连接，不会多出一个机器人。
+     */
     private fun verifyAndStartHosting(info: RoomInfo) {
         val roomId = info.roomId?.trim()
         val secret = info.secret?.trim()
@@ -1097,14 +1148,45 @@ class MainActivity : AppCompatActivity() {
             showTip("口令格式错误：未解析到合法的6位房间号或密钥！")
             return
         }
-        if (isPublishing) return
+        if (isPublishing || isVerifyingSecret) return
 
-        val token = sessionManager.getToken()
-        if (token.isNullOrEmpty()) {
+        if (sessionManager.getToken().isNullOrEmpty()) {
             showTip("请先登录")
             return
         }
 
+        isVerifyingSecret = true
+        pendingRoomInfo = info
+        setPublishControlsEnabled(false, "校验中...")
+        showTip("正在校验邀请口令...")
+
+        startNeriWatcher(info)
+
+        verifyJob?.cancel()
+        verifyJob = lifecycleScope.launch {
+            delay(SECRET_VERIFY_TIMEOUT_MS)
+            if (isVerifyingSecret) {
+                cancelSecretVerification()
+                showTip("无法连接播放器服务器，请检查口令或网络")
+            }
+        }
+    }
+
+    /** Neri 确认 join 成功：口令有效，这才轮到后端开房 */
+    private fun onNeriConnected() {
+        if (!isVerifyingSecret) return
+
+        val info = pendingRoomInfo
+        val token = sessionManager.getToken()
+        if (info == null || token.isNullOrEmpty()) {
+            cancelSecretVerification()
+            showTip("请先登录")
+            return
+        }
+
+        verifyJob?.cancel()
+        verifyJob = null
+        isVerifyingSecret = false
         isPublishing = true
         setPublishControlsEnabled(false, "开启中...")
 
@@ -1115,12 +1197,19 @@ class MainActivity : AppCompatActivity() {
 
             when (outcome) {
                 is StartOutcome.Ok -> onHostingStarted(info, outcome.room)
+
+                // 后面这几种都是「没开成」，Neri 那条连接必须收掉，否则会一直挂着
                 is StartOutcome.Conflict -> {
+                    abandonPendingRoom()
                     showTip(outcome.message)
                     renderFromSnapshot()
                 }
-                StartOutcome.Unauthorized -> forceReLogin("登录状态已失效，请重新登录")
+                StartOutcome.Unauthorized -> {
+                    abandonPendingRoom()
+                    forceReLogin("登录状态已失效，请重新登录")
+                }
                 is StartOutcome.Failed -> {
+                    abandonPendingRoom()
                     showTip(outcome.message ?: "开启失败")
                     renderFromSnapshot()
                 }
@@ -1128,25 +1217,75 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 口令校验失败或超时：收掉 Neri 连接、恢复按钮，绝不碰后端 */
+    private fun cancelSecretVerification() {
+        verifyJob?.cancel()
+        verifyJob = null
+        isVerifyingSecret = false
+        pendingRoomInfo = null
+        neriWatcher.stopWatching()
+        setPublishControlsEnabled(true, "开启")
+    }
+
+    /** 后端没接受这次开房，把已经建立的 Neri 连接收干净 */
+    private fun abandonPendingRoom() {
+        pendingRoomInfo = null
+        neriWatcher.stopWatching()
+    }
+
     private fun onHostingStarted(info: RoomInfo, room: ActiveRoom?) {
         hostReviveCount = 0
         isHosting = true
         currentRoomInfo = info
+        pendingRoomInfo = null
 
         persistHostingRoom(info)
         etInviteCode.setText("")
+        setPublishControlsEnabled(true, "开启")
 
+        // 幂等：校验阶段就已经连上了，这里不会重复建连
         startNeriWatcher(info)
         startHostKeepalive()
 
+        // 校验阶段缓存下来的首帧现在补上，否则要等到下一次切歌才有画面
+        replayCachedPlayback()
+
         room?.let { renderRoom(it) }
         showTip("房间上线成功！")
+    }
+
+    /** 把校验阶段从 join 响应里拿到的首帧播放状态补画出来并上报给后端 */
+    private fun replayCachedPlayback() {
+        val title = liveSongTitle ?: return
+
+        layoutAudioPlayerCard.isVisible = true
+        tvPlayerSongTitle.text = title
+        tvPlayerArtist.text = liveArtist ?: "NeriPlayer"
+        tvPlayerSongTitle.isSelected = true
+        loadCircleImage(ivPlayerAlbumCover, liveCoverUrl)
+
+        if (liveDurationMs > 0) {
+            progressTracker.useLocalClock()
+            progressTracker.updateMetrics(
+                durationMs = liveDurationMs,
+                basePositionMs = liveBasePosMs,
+                baseTimestampMs = liveAnchorAtMs,
+                playbackRate = livePlaybackRate,
+                isPlaying = liveIsPlaying
+            )
+        }
+
+        pushHostState(includePlayback = true)
     }
 
     private fun stopHosting(notifyServer: Boolean) {
         val wasHosting = isHosting
 
         isHosting = false
+        isVerifyingSecret = false
+        verifyJob?.cancel()
+        verifyJob = null
+        pendingRoomInfo = null
         hostReviveCount = 0
         hostKeepaliveJob?.cancel()
         hostKeepaliveJob = null
@@ -1161,6 +1300,7 @@ class MainActivity : AppCompatActivity() {
         liveBasePosMs = 0L
         liveAnchorAtMs = 0L
         liveIsPlaying = false
+        livePlaybackRate = 1.0
 
         if (wasHosting && notifyServer) {
             suppressRoomClosedUntil = System.currentTimeMillis() + ROOM_CLOSED_SUPPRESS_MS

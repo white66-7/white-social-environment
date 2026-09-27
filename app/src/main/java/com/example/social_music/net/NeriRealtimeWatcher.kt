@@ -28,14 +28,34 @@ class NeriRealtimeWatcher(
         playbackRate: Double,
         isPlaying: Boolean
     ) -> Unit,
-    private val onRoomClosed: () -> Unit
+    private val onRoomClosed: () -> Unit,
+    /**
+     * join 成功、确认「房间真实存在且密钥有效」时回调。
+     * 上层靠它决定要不要去后端开房 —— 先验证再开房，避免留下幽灵房。
+     */
+    private val onConnected: () -> Unit
 ) {
     companion object {
         private const val TAG = "NeriWatcher"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private const val PREF_NAME = "neri_watcher_prefs"
         private const val KEY_DEVICE_UUID = "device_uuid"
+
+        /** 断线后静默重连的延迟 */
+        private const val RETRY_DELAY_MS = 3_000L
+
+        /** 断线时那次「房间还在不在」探测的超时，必须短，不能把重连拖住 */
+        private const val PROBE_TIMEOUT_MS = 3_000L
     }
+
+    /**
+     * 专用于存活探测的客户端：超时开得很短。
+     * 复用主客户端不行 —— 它的读超时是 12 秒，探测一旦卡住会把重连一起拖死。
+     */
+    private val probeClient = OkHttpClient.Builder()
+        .connectTimeout(PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .readTimeout(PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        .build()
 
     // ⚡ 每台设备持久化分配独立 UUID，杜绝多个用户共用相同静态 UUID 导致互相顶号
     private val deviceUuid: String by lazy {
@@ -56,11 +76,23 @@ class NeriRealtimeWatcher(
         .build()
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var activeWebSocket: WebSocket? = null
-    private var activeJoinCall: Call? = null
-    private var currentRoomId: String? = null
-    private var isClosedManually = false
-    private var isConnecting = false
+
+    // 下面这些字段会被 OkHttp 的回调线程读写，统一标 @Volatile
+    @Volatile private var activeWebSocket: WebSocket? = null
+    @Volatile private var activeJoinCall: Call? = null
+    @Volatile private var currentRoomId: String? = null
+    @Volatile private var isClosedManually = false
+    @Volatile private var isConnecting = false
+
+    /**
+     * 每次 startWatching 自增，回调里靠它判断自己是不是「上一代」连接。
+     *
+     * 不能拿 socket 引用做比对：newWebSocket() 返回之前回调就可能已经触发，
+     * 那一刻 activeWebSocket 还是 null，于是 onClosing / onClosed / onFailure
+     * 会被整个丢掉 —— 长连接早已断开却永远不重连，房间没了也永远不知道。
+     * 表现就是房主端一直停在「你正在放歌」、谁也关不掉。
+     */
+    @Volatile private var generation = 0
 
     @Synchronized
     fun startWatching(serverUrl: String, roomId: String, secret: String, userNickname: String = "群友伴侣") {
@@ -69,6 +101,8 @@ class NeriRealtimeWatcher(
         }
 
         stopWatching()
+        // stopWatching() 已经把上一代作废，这里取一个新的代号
+        val myGeneration = ++generation
         currentRoomId = roomId
         isClosedManually = false
         isConnecting = true
@@ -93,15 +127,17 @@ class NeriRealtimeWatcher(
                 val joinResp = activeJoinCall?.execute() ?: return@Thread
                 val respBody = joinResp.body?.string().orEmpty()
 
+                if (myGeneration != generation) return@Thread
+
                 // 404 或 410 说明房间在服务端已销毁
                 if (joinResp.code in listOf(404, 410)) {
                     Log.w(TAG, "房间在服务端已失效: code=${joinResp.code}")
-                    notifyRoomClosed()
+                    notifyRoomClosed(myGeneration)
                     return@Thread
                 }
 
                 if (!joinResp.isSuccessful || respBody.isEmpty()) {
-                    scheduleSilentRetry(serverUrl, roomId, secret, userNickname)
+                    scheduleSilentRetry(serverUrl, roomId, secret, userNickname, myGeneration)
                     return@Thread
                 }
 
@@ -109,9 +145,9 @@ class NeriRealtimeWatcher(
                 if (!json.optBoolean("ok", false)) {
                     val err = json.optString("error", "")
                     if (err.contains("not found", ignoreCase = true) || err.contains("missing", ignoreCase = true)) {
-                        notifyRoomClosed()
+                        notifyRoomClosed(myGeneration)
                     } else {
-                        scheduleSilentRetry(serverUrl, roomId, secret, userNickname)
+                        scheduleSilentRetry(serverUrl, roomId, secret, userNickname, myGeneration)
                     }
                     return@Thread
                 }
@@ -120,7 +156,10 @@ class NeriRealtimeWatcher(
                 val initState = json.optJSONObject("state")
                 initState?.let { parseAndDispatchState(it) }
 
-                if (token.isEmpty() || isClosedManually) return@Thread
+                // join 已经被服务端接受 —— 口令是真的，房间也真的存在
+                notifyConnected(myGeneration)
+
+                if (token.isEmpty() || isClosedManually || myGeneration != generation) return@Thread
 
                 val wsUrl = baseUrl.replaceFirst("http://", "ws://")
                     .replaceFirst("https://", "wss://") + "/api/rooms/$roomId/ws?token=$token"
@@ -132,19 +171,19 @@ class NeriRealtimeWatcher(
 
                 val newWs = client.newWebSocket(wsRequest, object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
-                        if (webSocket !== activeWebSocket) return
+                        if (myGeneration != generation) return
                         isConnecting = false
                         Log.i(TAG, "🚀 Neri WebSocket 连接成功！正在监听切歌事件...")
                     }
 
                     override fun onMessage(webSocket: WebSocket, text: String) {
-                        if (webSocket !== activeWebSocket) return
+                        if (myGeneration != generation) return
                         try {
                             val msg = JSONObject(text)
                             val type = msg.optString("type", "")
                             // ⚡ 仅当收到明确的解散通知时，才回调房间关闭
                             if (type == "ROOM_CLOSED" || type == "ROOM_DESTROYED") {
-                                notifyRoomClosed()
+                                notifyRoomClosed(myGeneration)
                                 return
                             }
                             val state = msg.optJSONObject("state") ?: msg
@@ -155,22 +194,27 @@ class NeriRealtimeWatcher(
                     }
 
                     override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                        if (webSocket !== activeWebSocket || isClosedManually) return
-                        scheduleSilentRetry(serverUrl, roomId, secret, userNickname)
+                        if (myGeneration != generation) return
+                        // 对端发起关闭，回一个关闭帧收尾。
+                        // 真正的恢复动作统一放在 onClosed 里 ——
+                        // 两边都做会把探测和重连各跑一遍。
+                        webSocket.close(1000, null)
                     }
 
                     override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                        if (webSocket !== activeWebSocket || isClosedManually) return
-                        scheduleSilentRetry(serverUrl, roomId, secret, userNickname)
+                        if (myGeneration != generation || isClosedManually) return
+                        Log.w(TAG, "长连接已关闭(code=$code)，先确认房间是否还在")
+                        probeRoomThenRecover(serverUrl, roomId, secret, userNickname, myGeneration)
                     }
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                        if (webSocket !== activeWebSocket || isClosedManually) return
-                        Log.w(TAG, "WebSocket 波动异常: ${t.message}，正在静默重连...")
+                        if (myGeneration != generation || isClosedManually) return
+                        Log.w(TAG, "WebSocket 波动异常: ${t.message}")
+                        // 404/410 = 房间已经没了，重连多少次都没用
                         if (response?.code in listOf(404, 410)) {
-                            notifyRoomClosed()
+                            notifyRoomClosed(myGeneration)
                         } else {
-                            scheduleSilentRetry(serverUrl, roomId, secret, userNickname)
+                            probeRoomThenRecover(serverUrl, roomId, secret, userNickname, myGeneration)
                         }
                     }
                 })
@@ -179,32 +223,94 @@ class NeriRealtimeWatcher(
 
             } catch (e: Exception) {
                 if (!isClosedManually) {
-                    scheduleSilentRetry(serverUrl, roomId, secret, userNickname)
+                    scheduleSilentRetry(serverUrl, roomId, secret, userNickname, myGeneration)
                 }
             } finally {
-                activeJoinCall = null
-                // 无论走哪条分支都要清掉「正在连接」标记。
-                // 那些提前 return 的分支（房间失效 / token 为空）如果漏掉它，
-                // startWatching 的幂等检查会认为连接还在，同一房间号就再也连不上了。
-                isConnecting = false
+                // 只有仍是「当代」连接时才回收这些标记，
+                // 否则会把新一代连接的状态一并清掉
+                if (myGeneration == generation) {
+                    activeJoinCall = null
+                    // 无论走哪条分支都要清掉「正在连接」标记。
+                    // 那些提前 return 的分支（房间失效 / token 为空）如果漏掉它，
+                    // startWatching 的幂等检查会认为连接还在，同一房间号就再也连不上了。
+                    isConnecting = false
+                }
             }
         }.start()
     }
 
-    private fun scheduleSilentRetry(serverUrl: String, roomId: String, secret: String, userNickname: String) {
-        isConnecting = false
-        if (isClosedManually) return
-        mainHandler.postDelayed({
-            if (!isClosedManually && currentRoomId == roomId) {
-                startWatching(serverUrl, roomId, secret, userNickname)
+    /**
+     * 长连接断开时的处理：先花几百毫秒问一次「房间还在不在」，再决定重连还是上报关闭。
+     *
+     * 以前是直接排一个 3 秒后的重连，靠重连时的 join 拿 404 才知道房间没了 ——
+     * 光这一步就固定吃掉 3 秒多。改成先探测，房间没了就能立刻上报，
+     * 只有确实还在（普通网络抖动）才走 3 秒重连。
+     *
+     * 用的是只读的 GET /api/rooms/{id}/state，不会像 join 那样往房间里塞机器人。
+     */
+    private fun probeRoomThenRecover(
+        serverUrl: String,
+        roomId: String,
+        secret: String,
+        userNickname: String,
+        myGeneration: Int
+    ) {
+        Thread {
+            if (myGeneration != generation || isClosedManually) return@Thread
+
+            val gone = try {
+                val req = Request.Builder()
+                    .url("${serverUrl.trimEnd('/')}/api/rooms/$roomId/state")
+                    .get()
+                    .build()
+                probeClient.newCall(req).execute().use { it.code == 404 || it.code == 410 }
+            } catch (e: Exception) {
+                // 探测本身失败（比如真的没网）不能当成「房间没了」
+                false
             }
-        }, 3000L)
+
+            if (myGeneration != generation || isClosedManually) return@Thread
+
+            if (gone) {
+                Log.w(TAG, "探测到房间已不存在，立即上报关闭")
+                notifyRoomClosed(myGeneration)
+            } else {
+                scheduleSilentRetry(serverUrl, roomId, secret, userNickname, myGeneration)
+            }
+        }.start()
     }
 
-    private fun notifyRoomClosed() {
+    private fun scheduleSilentRetry(
+        serverUrl: String,
+        roomId: String,
+        secret: String,
+        userNickname: String,
+        myGeneration: Int
+    ) {
+        // 上一代连接的重试不能把新一代连接搅乱
+        if (myGeneration != generation) return
+        isConnecting = false
         if (isClosedManually) return
+
+        mainHandler.postDelayed({
+            if (myGeneration == generation && !isClosedManually && currentRoomId == roomId) {
+                startWatching(serverUrl, roomId, secret, userNickname)
+            }
+        }, RETRY_DELAY_MS)
+    }
+
+    private fun notifyConnected(myGeneration: Int) {
+        if (myGeneration != generation || isClosedManually) return
         mainHandler.post {
-            onRoomClosed()
+            if (myGeneration == generation) onConnected()
+        }
+    }
+
+    private fun notifyRoomClosed(myGeneration: Int) {
+        if (myGeneration != generation || isClosedManually) return
+        mainHandler.post {
+            // 到主线程时可能已经换了房间，必须再确认一次
+            if (myGeneration == generation) onRoomClosed()
         }
     }
 
@@ -277,6 +383,8 @@ class NeriRealtimeWatcher(
 
     @Synchronized
     fun stopWatching() {
+        // 让所有在途的回调与重试立即失效
+        generation++
         isClosedManually = true
         isConnecting = false
         // ⚡ 彻底清除 Handler 内部所有待执行的重试任务，防止新房间上线时被旧重试回调打乱
