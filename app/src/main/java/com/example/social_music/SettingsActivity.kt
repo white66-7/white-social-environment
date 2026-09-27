@@ -211,7 +211,7 @@ class SettingsActivity : AppCompatActivity() {
 
         val requestBody = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
         val request = Request.Builder()
-            .url("https://www.white667.xyz/api/user/update-name")
+            .url("https://white667.xyz/api/user/update-name")
             .post(requestBody)
             .build()
 
