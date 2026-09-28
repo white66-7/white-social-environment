@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      记在 View 上的 tag key：这个 View 当前显示的图片 URL。
+      用来跳过重复的 Coil 加载 —— Coil 有内存缓存，但每次仍会新建一次请求并重放
+      淡入动画，连续切歌时这些冗余工作会挤在主线程上。
+    -->
+    <item name="tag_image_url" type="id" />
+</resources>

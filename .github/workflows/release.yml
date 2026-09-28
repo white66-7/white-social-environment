@@ -1,0 +1,110 @@
+name: Build and Release Android App
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '手动指定发布版本号（选填，留空则自动读取 CHANGELOG）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js (用于提取版本号和更新日志)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 1. 核心：自动从 CHANGELOG.md 第一行提取最新版本号和更新日志
+      - name: Parse Version and Notes from CHANGELOG
+        id: parse_changelog
+        shell: node {0}
+        run: |
+          const fs = require('fs');
+          if (!fs.existsSync('CHANGELOG.md')) {
+            console.error('未找到 CHANGELOG.md 文件');
+            process.exit(1);
+          }
+          const content = fs.readFileSync('CHANGELOG.md', 'utf8');
+          
+          // 如果是手动触发且输入了版本号则优先使用，否则自动获取 CHANGELOG 顶部的第一个版本号
+          let targetVersion = "${{ inputs.version }}".trim();
+          if (!targetVersion) {
+            const firstHeaderMatch = content.match(/##\s*\[?([vV]?[\d\.]+)\]?/);
+            if (!firstHeaderMatch) {
+              console.error('无法从 CHANGELOG.md 顶部解析出版本号！');
+              process.exit(1);
+            }
+            targetVersion = firstHeaderMatch[1];
+          }
+          
+          // 提取该版本的更新内容
+          const versionNum = targetVersion.replace(/^[vV]/, '').trim();
+          const regex = new RegExp(`##\\s*\\[?[vV]?${versionNum}\\]?[^\\n]*\\n([\\s\\S]*?)(?=\\n##|$)`, 'i');
+          const match = content.match(regex);
+          const notes = (match && match[1]) ? match[1].trim() : `Release ${targetVersion}`;
+          
+          fs.writeFileSync('CURRENT_RELEASE_NOTES.md', notes);
+          
+          // 写入 GitHub 输出变量
+          const finalTag = targetVersion.startsWith('v') || targetVersion.startsWith('V') ? targetVersion : `V${targetVersion}`;
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${finalTag}\n`);
+          console.log(`已自动识别最新发布版本: ${finalTag}`);
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # 2. 执行 Android Gradle 打包
+      - name: Build Android APK
+        run: ./gradlew assembleRelease
+
+      # 3. 提取 APK 并重命名为 white.apk
+      - name: Prepare APK Asset
+        run: |
+          APK_FILE=$(find app/build/outputs/apk/release/ -name "*.apk" | head -n 1)
+          if [ -z "$APK_FILE" ]; then
+            APK_FILE=$(find . -name "*release*.apk" | head -n 1)
+          fi
+          
+          if [ -f "$APK_FILE" ]; then
+            cp "$APK_FILE" white.apk
+            echo "APK 准备完毕: white.apk"
+          else
+            echo "::error::未找到打包生成的 APK 文件！"
+            exit 1
+          fi
+
+      # 4. 发布 Release 并上传 APK
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.parse_changelog.outputs.version }}
+          name: "${{ steps.parse_changelog.outputs.version }}"
+          body_path: CURRENT_RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+          files: white.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

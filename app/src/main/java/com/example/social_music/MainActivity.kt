@@ -9,7 +9,11 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.text.Editable
+import android.text.SpannableString
+import android.text.Spanned
 import android.text.TextWatcher
+import android.text.style.ForegroundColorSpan
+import android.text.style.RelativeSizeSpan
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -71,6 +75,24 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
         private const val ROOM_CLOSED_SUPPRESS_MS = 5_000L
 
         /**
+         * 快照里房间消失多久，界面才真的收起来（抗闪屏）。
+         *
+         * 弱网下这个「消失」经常是瞬时的：心跳超时被回收后正在重挂、
+         * 或者开房时 pending 占位房间还没点亮。立刻塌成「空闲」再弹回去，
+         * 就是用户看到的闪屏。撑过这个宽限期才认账。
+         *
+         * 真正的关房（主动关播、播放器房间结束）直接调 renderRoom(null)，
+         * 不走这条路径，所以不会因此显得迟钝。
+         */
+        private const val ROOM_MISSING_GRACE_MS = 4_000L
+
+        /**
+         * 长连接断掉多久才显示「连接不稳定」。
+         * 弱网下长连接会反复掉线重连，不加这个宽限期角标会一直闪。
+         */
+        private const val REALTIME_UNSTABLE_GRACE_MS = 3_000L
+
+        /**
          * 校验邀请口令的超时时间。
          * 超过这么久播放器服务器还没确认 join 成功，就认为口令已失效或服务不可达，
          * 直接放弃开房 —— 绝不在后端留下一个指向不存在房间的幽灵房。
@@ -115,6 +137,28 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
      * 但得让用户知道看到的东西可能已经过时，不然一首早就切掉的歌会一直显示成正在播放。
      */
     private var realtimeDown = false
+
+    /** 开始断线的时刻，用来给「连接不稳定」角标做抗抖 */
+    private var realtimeDownSince = 0L
+
+    /**
+     * 快照里房间开始消失的时刻（0 = 当前有房间）。
+     * 配合 [ROOM_MISSING_GRACE_MS] 做抗闪屏。
+     */
+    private var roomMissingSince = 0L
+
+    /** 状态行的「人话」部分（不含调试统计那半行） */
+    private var hostMessageBase = ""
+
+    /** 上次画进状态行的完整文本，用来跳过重复的 setText */
+    private var lastHostMessageText: String? = null
+
+    /**
+     * 上次收到服务端快照的时刻（成员端用）。
+     * 房主每 20 秒一次心跳都会触发广播，所以这个数字正常应该一直 ≤ 二十几秒；
+     * 一直往上涨就说明成员端已经收不到服务器的推送了。
+     */
+    private var lastSnapshotAtMs = 0L
 
     // ---------- 房主本地状态 ----------
     // Neri 长连接、保活循环、状态上报和房主记录都已经搬进 HostSession ——
@@ -320,6 +364,10 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
             scope = lifecycleScope,
             onProgressTick = { ratio ->
                 pbPlayerProgress.progress = (ratio * 1000).toInt()
+                // 蹭这个已有的 500ms 心跳刷新调试行，省得再挂一套定时器
+                renderHostMessage()
+                // 宽限期到点后要把界面真的收起来，而那时不一定有新快照进来
+                if (roomMissingSince != 0L) applyRoomDisplay(snapshot?.room)
             },
             onSongFinished = {}
         )
@@ -340,6 +388,7 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
                 // 通道恢复：把「连接不稳定」的标记撤掉
                 if (realtimeDown) {
                     realtimeDown = false
+                    realtimeDownSince = 0L
                     renderFromSnapshot()
                 }
             }
@@ -351,10 +400,17 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
                     forceReLogin("登录状态已失效，请重新登录")
                     return
                 }
-                // 画面保持不动，但必须让用户知道「现在看到的可能已经过时了」，
-                // 而不是让一首已经切掉的歌继续显示成正在播放。
+                if (realtimeDown) return
+
+                // 弱网下长连接会反复掉线重连。立刻显示角标、连上又撤掉，
+                // 这个角标就会一直闪 —— 反而比不显示更烦人。
+                // 所以先记下时刻，撑过宽限期还断着才真的显示出来。
                 realtimeDown = true
-                renderFromSnapshot()
+                realtimeDownSince = System.currentTimeMillis()
+                lifecycleScope.launch {
+                    delay(REALTIME_UNSTABLE_GRACE_MS)
+                    if (realtimeDown) renderFromSnapshot()
+                }
             }
         })
     }
@@ -654,6 +710,9 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
         onlineQq = emptySet()
         hostQq = null
         realtimeDown = false
+        realtimeDownSince = 0L
+        roomMissingSince = 0L
+        lastSnapshotAtMs = 0L
         lastVersion = 0L
         snapshot = null
         hasRenderedOnce = false
@@ -710,10 +769,15 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
     private fun applySnapshot(incoming: RoomSnapshot) {
         // 乱序到达的旧快照直接丢弃，绝不让它把新状态覆盖回去
         if (incoming.version < lastVersion) return
+        // 同一个版本重复到达（启动时 REST 快照 + 长连接握手广播就是同一个版本）
+        // 内容必然一样，没必要再整屏重画一遍。
+        // hasRenderedOnce 是必须的：首帧的版本号恰好也是 0，不能被当成「重复」丢掉。
+        if (hasRenderedOnce && incoming.version == lastVersion) return
         lastVersion = incoming.version
 
         snapshot = incoming
         hasRenderedOnce = true
+        lastSnapshotAtMs = System.currentTimeMillis()
 
         // 实时在线集合，花名册的角标全靠它
         onlineQq = incoming.members.map { it.qq }.filter { it.isNotEmpty() }.toSet()
@@ -737,7 +801,36 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
             progressTracker.updateServerTime(snap.serverTime)
         }
 
-        renderRoom(snap.room)
+        applyRoomDisplay(snap.room)
+    }
+
+    /**
+     * 把「服务端有没有房间」映射到界面，带抗抖。
+     *
+     * 弱网下房间会**短暂**地在快照里消失：可能是被心跳超时回收后正在重挂，
+     * 也可能是开房时那个 pending 占位房间还没被点亮。
+     * 立刻塌成「空闲」、下一帧又弹回「正在放歌」，就是用户看到的闪屏。
+     *
+     * 所以先给一个宽限期：期间界面保持原样，撑过去了才真的收回。
+     * 真正关房（用户主动关播、播放器里的房间结束）会直接调 renderRoom(null)，
+     * 不走这里，所以不会因此显得迟钝。
+     */
+    private fun applyRoomDisplay(room: ActiveRoom?) {
+        if (room != null) {
+            roomMissingSince = 0L
+            renderRoom(room)
+            return
+        }
+
+        val since = roomMissingSince
+        if (since == 0L) {
+            roomMissingSince = System.currentTimeMillis()
+            return
+        }
+        if (System.currentTimeMillis() - since < ROOM_MISSING_GRACE_MS) return
+
+        roomMissingSince = 0L
+        renderRoom(null)
     }
 
     /** 首屏加载动画只在「真的还没有任何数据」时出现，不再每次 onResume 都闪一下 */
@@ -750,7 +843,8 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
 
         switchAnimation(AnimationTemplates.ANIM_SPINNER)
         tvHostMessage.isVisible = false
-        tvHostMessage.text = ""
+        hostMessageBase = ""
+        lastHostMessageText = null
         layoutAudioPlayerCard.isVisible = false
         ivHostAvatar.isVisible = false
         btnJoin.isVisible = false
@@ -760,7 +854,7 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
     private fun renderLoggedOutState() {
         switchAnimation(AnimationTemplates.ANIM_HEX)
         tvHostMessage.isVisible = true
-        tvHostMessage.text = "登录后即可加入群友的房间"
+        applyHostMessage("登录后即可加入群友的房间")
 
         ivHostAvatar.isVisible = false
         btnJoin.isVisible = false
@@ -776,11 +870,77 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
     private fun renderUnavailableState() {
         switchAnimation(AnimationTemplates.ANIM_HEX)
         tvHostMessage.isVisible = true
-        tvHostMessage.text = "暂时连不上服务器"
+        applyHostMessage("暂时连不上服务器")
 
         ivHostAvatar.isVisible = false
         btnJoin.isVisible = false
         layoutHostSection.isVisible = false
+    }
+
+    /**
+     * 状态行 = 一句人话 + 一行灰色的上报统计。
+     *
+     * 临时调试用：排查「切歌跟不上」时，光看界面看不出上报到底有没有送出去。
+     * 查完把这里、[hostMessageBase] 和 HostSession.pushStatsLine() 一起删掉即可。
+     */
+    private fun applyHostMessage(base: String) {
+        hostMessageBase = base
+        lastHostMessageText = null   // 强制重画一次
+        renderHostMessage()
+    }
+
+    private fun renderHostMessage() {
+        val base = hostMessageBase
+        if (!tvHostMessage.isVisible || base.isEmpty()) return
+
+        val debug = debugLine()
+        val full = if (debug.isNullOrEmpty()) base else "$base\n$debug"
+        if (full == lastHostMessageText) return
+        lastHostMessageText = full
+
+        tvHostMessage.text = if (debug.isNullOrEmpty()) {
+            full
+        } else {
+            SpannableString(full).apply {
+                val start = base.length + 1
+                // 后半行做小做灰，别让它抢了状态本身的注意力
+                setSpan(RelativeSizeSpan(0.52f), start, full.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                setSpan(ForegroundColorSpan(0xFF94A3B8.toInt()), start, full.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+        }
+    }
+
+    /**
+     * 临时调试行。查完连同 [applyHostMessage] / [renderHostMessage] 一起删。
+     *
+     * 房主：上报统计 + 收包间隔
+     * 成员：收包间隔
+     *
+     * 「收包间隔」是两边共用的关键指标 —— 房主自己的 App 也在接收服务端广播，
+     * 所以这个数字反映的就是**所有客户端**收到推送的新鲜度，
+     * 拿一台手机就能同时看清"发得出去"和"收得到"这两件事。
+     */
+    private fun debugLine(): String? {
+        val parts = ArrayList<String>(4)
+
+        if (HostSession.isHosting) {
+            HostSession.pushStatsLine()?.let { parts += it }
+        }
+        if (lastSnapshotAtMs > 0) {
+            parts += "收包${(System.currentTimeMillis() - lastSnapshotAtMs) / 1000}s前"
+        }
+        if (realtimeDown) parts += "通道断开中"
+
+        // ⚠️ 最关键的一条：本机认为在放的歌 vs 服务端快照里存着的歌。
+        // 房主自己的 App 也在收服务端广播，所以这一个对比就能判断
+        // 「上报有没有落地」—— 不一致就说明是上报这一环丢了，而不是广播或成员端。
+        val local = HostSession.liveDisplaySong
+        val server = snapshot?.room?.currentSong
+        if (HostSession.isHosting && !local.isNullOrEmpty() && !server.isNullOrEmpty() && local != server) {
+            parts += "⚠未同步 本机[${local.take(14)}] 服务端[${server.take(14)}]"
+        }
+
+        return parts.takeIf { it.isNotEmpty() }?.joinToString(" ")
     }
 
     private fun renderRoom(room: ActiveRoom?) {
@@ -788,7 +948,7 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
         tvHostMessage.isVisible = true
 
         if (room == null) {
-            tvHostMessage.text = "空闲"
+            applyHostMessage("空闲")
             tvPlayerSongTitle.text = ""
             tvPlayerArtist.text = ""
             ivPlayerAlbumCover.setImageResource(R.drawable.bg_avatar_gray)
@@ -805,8 +965,11 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
 
         val meHosting = isMeHosting(room)
         val baseMessage = if (meHosting) "你正在放歌" else "${room.inviter ?: "群友"} 正在放歌"
-        // 掉线时画面照旧，但明确标出来 —— 用户至少知道该等一下，而不是以为切歌坏了
-        tvHostMessage.text = if (realtimeDown) "$baseMessage · 连接不稳定" else baseMessage
+        // 掉线时画面照旧，但明确标出来 —— 用户至少知道该等一下，而不是以为切歌坏了。
+        // 同样要撑过宽限期：弱网下这个角标闪起来比不显示更烦人。
+        val unstable = realtimeDown &&
+            System.currentTimeMillis() - realtimeDownSince >= REALTIME_UNSTABLE_GRACE_MS
+        applyHostMessage(if (unstable) "$baseMessage · 连接不稳定" else baseMessage)
 
         renderPlayerCard(room, meHosting)
 
@@ -840,7 +1003,7 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
         )
 
         tvHostMessage.isVisible = true
-        tvHostMessage.text = "你正在放歌"
+        applyHostMessage("你正在放歌")
         ivHostAvatar.isVisible = true
         btnJoin.isVisible = false
         layoutHostSection.isVisible = false
@@ -1172,6 +1335,27 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
         // 通过排序检查，把刚关掉的房间又画回来。
         if (version > lastVersion) lastVersion = version
 
+        // 心跳超时是**可恢复**的：播放器那边的房间大概率还活着，
+        // 只是我们这边一段时间没能把心跳送达（弱网下的常态）。
+        //
+        // 以前这条路径会把整个会话拆掉 —— 包括 Neri 长连接和本地播放状态 ——
+        // 再让重挂逻辑从零建一遍。用户看到的就是
+        // 「正在放歌 → 空闲 → 正在放歌」的闪屏，而且每次重建都要重新 join 播放器，
+        // 那一步恰恰是会被 403 member_secret_required 挡住的。
+        //
+        // 改成只标记「服务端那份房间记录丢了」，交给 reconcileHosting 用 reattach 重挂：
+        // 长连接和当前这首歌曲都原样保留，屏幕上几乎看不出发生过什么。
+        if (reason == "timeout" && HostSession.isHosting) {
+            Log.i(TAG, "心跳超时导致服务端房间被回收，保留本地会话，改为重挂")
+            hostRoomLost = true
+            snapshot = snapshot?.copy(room = null)
+            hostQq = null
+            refreshMembersTab()
+            // 立刻触发重挂，别干等下一次快照
+            reconcileHosting(null)
+            return
+        }
+
         val wasHosting = HostSession.isHosting
         stopHosting(notifyServer = false)
 
@@ -1466,11 +1650,22 @@ class MainActivity : AppCompatActivity(), HostSession.Listener {
     private fun dp2px(dp: Int): Int = (dp * resources.displayMetrics.density + 0.5f).toInt()
 
     private fun loadCircleImage(view: ShapeableImageView, url: String?) {
-        if (url.isNullOrEmpty()) {
+        // 同一个 URL 不重复加载。
+        //
+        // Coil 有内存缓存，所以"重复加载"不至于重新下载；但它每次仍会新建一次请求、
+        // 走一遍编解码和淡入动画。连续切歌时房间快照会密集到达，这些冗余工作全挤在
+        // 主线程上，界面就开始跟不上 —— 而封面其实根本没变。
+        val key = url.orEmpty()
+        if (view.getTag(R.id.tag_image_url) == key) return
+
+        if (key.isEmpty()) {
+            view.setTag(R.id.tag_image_url, key)
             view.setImageResource(R.drawable.bg_avatar_gray)
             return
         }
-        view.load(url) {
+
+        view.setTag(R.id.tag_image_url, key)
+        view.load(key) {
             crossfade(true)
             placeholder(R.drawable.bg_avatar_gray)
             error(R.drawable.bg_avatar_gray)

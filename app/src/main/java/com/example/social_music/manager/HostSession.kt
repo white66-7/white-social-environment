@@ -21,7 +21,9 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import kotlin.math.abs
 
 /**
  * 房主端的一次实时播放快照。不可变，供界面与通知栏消费。
@@ -94,6 +96,12 @@ object HostSession {
     /** 续写房主记录时间戳的最小间隔，避免每 20 秒就写一次 SharedPreferences */
     private const val RECORD_REFRESH_INTERVAL_MS = 5 * 60 * 1000L
 
+    /**
+     * 判定「用户拖了进度条」的阈值。
+     * 上报的位置和「按上次锚点外推应该到哪」差得超过这个数，就当 seek 立刻上报。
+     */
+    private const val SEEK_THRESHOLD_MS = 5_000L
+
     enum class StopReason { USER, ROOM_CLOSED, AUTH_EXPIRED, TIMEOUT, SERVICE_GONE }
 
     /** 界面侧订阅者（MainActivity）。只关心房主会话相关的事件，不是一个全局状态总线。 */
@@ -151,6 +159,7 @@ object HostSession {
     private var pusher: HostStatePusher? = null
     private var sessionScope: CoroutineScope? = null
     private var keepaliveJob: Job? = null
+    private var neriWatchdogJob: Job? = null
 
     private var room: RoomInfo? = null
     private var live: LivePlayback? = null
@@ -163,6 +172,72 @@ object HostSession {
     /** 已经预热过的播放器服务器地址，避免重复发预热请求 */
     private val warmedServers = HashSet<String>()
 
+    /** 因节流而没上报的纯进度事件数（临时调试用） */
+    private var throttledUpdates = 0L
+
+    /** Neri 推过来的事件计数与时刻（临时调试用） */
+    private var neriEventCount = 0L
+    private var lastNeriEventAtMs = 0L
+
+    /** 只读补状态连续失败的次数 */
+    private var pollFailures = 0
+
+    /**
+     * Neri 静默多久就判定它「连接活着但不再说话」，强制重连。
+     *
+     * 实测 NeriPlayer 会持续推送播放进度（每十来秒一条），所以几十秒毫无音讯就是异常。
+     * 这种故障最阴险的地方是**没有任何回调**：TCP 还连着、OkHttp 的 ping 还通，
+     * 于是 onFailure / onClosed 都不触发，重连逻辑根本不会被唤醒 ——
+     * 表现就是「歌卡在某一首再也不动了，而且所有指标看起来都正常」。
+     */
+    private const val NERI_SILENCE_TIMEOUT_MS = 60_000L
+
+    /** 看门狗的巡检间隔，比静默阈值小得多，保证能及时发现 */
+    private const val NERI_WATCHDOG_INTERVAL_MS = 15_000L
+
+    /**
+     * 完全没连接时，只读补状态的间隔。
+     *
+     * 这种情况最危险：join 可能正被 CDN 挡着、退避已经拉到几十秒，
+     * 只读接口是**唯一**还能拿到数据的地方。所以宁可勤一点，
+     * 也别让它退化成"一次 403 就永远不动了"。
+     */
+    private const val NERI_POLL_ONLY_INTERVAL_MS = 20_000L
+
+    /** 只读补状态连续失败多少次，才退回去打那个容易被 CDN 封的 join 接口 */
+    private const val MAX_POLL_FAILURES = 3
+
+    /**
+     * 临时调试：给界面看的一行上报统计。
+     *
+     * 排查「切歌跟不上」用 —— 关键是要能同时看到「Neri 到底推得多快」（节流数）
+     * 和「发出去的结果如何」（成功/抢发/迟到/失败）。
+     * 全部字段都靠得住之后，这个方法连同界面那一行可以一起删掉。
+     */
+    @MainThread
+    fun pushStatsLine(): String? {
+        if (!hosting) return null
+        val p = pusher ?: return null
+        val s = p.stats()
+
+        val now = System.currentTimeMillis()
+        val sinceOk = if (s.lastOkAtMs == 0L) "从未" else "${(now - s.lastOkAtMs) / 1000}s前"
+        val neriSilent = if (lastNeriEventAtMs == 0L) -1L else (now - lastNeriEventAtMs) / 1000
+
+        return buildString {
+            append("上报${s.total} 成功${s.ok} 节流${throttledUpdates}")
+            if (s.preempted > 0) append(" 抢发${s.preempted}")
+            if (s.stale > 0) append(" 迟到${s.stale}")
+            if (s.failed > 0) append(" 失败${s.failed}")
+            append(" 上次成功$sinceOk")
+            // Neri 那一路的新鲜度 —— 歌卡住不动时，先看这个数是不是在一直涨
+            append(" Neri${neriEventCount}条")
+            if (neriSilent >= 0) append(" 静默${neriSilent}s")
+            // 通道状态 + 上次 join 的结果：分清「没连上」「连了没订阅」「连了但服务端不说话」
+            append(" [${watcher?.channelState() ?: "无连接"}]")
+        }
+    }
+
     /** token 失效时置位，等 Activity 回到前台再消费（不能在后台弹登录页） */
     private var authExpired = false
 
@@ -170,6 +245,12 @@ object HostSession {
     val isHosting: Boolean get() = hosting
     val currentRoom: RoomInfo? get() = room
     val livePlayback: LivePlayback? get() = live
+
+    /**
+     * 本机认为正在放的歌（就是上报时用的那个字符串）。
+     * 和服务端快照里的 currentSong 一比，就能判断上报到底有没有落地。
+     */
+    val liveDisplaySong: String? get() = live?.displaySong
 
     // ==========================================================
     // 装配
@@ -342,6 +423,8 @@ object HostSession {
     private fun teardownSessionWork() {
         keepaliveJob?.cancel()
         keepaliveJob = null
+        neriWatchdogJob?.cancel()
+        neriWatchdogJob = null
         pusher?.stop()
         pusher = null
         sessionScope?.cancel()
@@ -459,6 +542,9 @@ object HostSession {
         playbackRate: Double,
         isPlaying: Boolean
     ) {
+        neriEventCount++
+        lastNeriEventAtMs = System.currentTimeMillis()
+
         if (!isActive) return
 
         if (songTitle.isNullOrBlank()) {
@@ -473,6 +559,7 @@ object HostSession {
         }
 
         val previous = live
+        val anchorAt = System.currentTimeMillis()
         val playback = LivePlayback(
             songTitle = songTitle,
             artist = artist,
@@ -480,7 +567,7 @@ object HostSession {
             durationMs = durationMs,
             basePosMs = basePosMs,
             // 用本机收到回调的时刻做锚点，天然把网络延迟算进去了
-            anchorAtMs = System.currentTimeMillis(),
+            anchorAtMs = anchorAt,
             isPlaying = isPlaying,
             playbackRate = playbackRate
         )
@@ -489,12 +576,30 @@ object HostSession {
         // 校验阶段只缓存首帧：画面与上报都等开房成功之后
         if (verifying) return
 
-        // 切歌 / 播放暂停是"必须立刻到"的事件；纯进度上报可以合并丢弃
-        val urgent = songTitle != lastPushedSong || previous?.isPlaying != isPlaying
-        lastPushedSong = songTitle
+        // 只在「真的变了」的时候上报。
+        //
+        // NeriPlayer 会持续推送播放进度，而进度**不需要**逐条转发：成员端是拿
+        // 锚点自己外推的（PlaybackProgressTracker），20 秒一次的心跳就会把锚点刷新。
+        // 以前每条都发，于是在跨境链路上形成一条永远发不完的队列 ——
+        // 连续切歌时新歌排在旧的位置更新后面，越堆越多，表现就是「后面跟不上了」。
+        // 通知栏和封面同理，也不该每秒重建一次。
+        val songChanged = songTitle != lastPushedSong
+        val playingChanged = previous?.isPlaying != isPlaying
+        // 位置跳变（用户拖了进度条）：和「按上次锚点应该走到哪」比，差得多就是 seek
+        val seeked = previous != null && !songChanged &&
+            abs(basePosMs - previous.positionMs(anchorAt)) > SEEK_THRESHOLD_MS
 
-        pusher?.push(playback.toPayload(), urgent = urgent)
-        hooks?.onUpdateNotification(playback)
+        if (songChanged || playingChanged || seeked) {
+            lastPushedSong = songTitle
+            pusher?.push(playback.toPayload(), urgent = true)
+            hooks?.onUpdateNotification(playback)
+        } else {
+            // 纯进度推送，按设计跳过。计数是为了验证「Neri 确实在高频推进度」这个前提 ——
+            // 如果这个数涨得很慢，说明前提不成立，节流本身就没省下什么。
+            throttledUpdates++
+        }
+
+        // 界面始终跟着实时更新（本地零延迟），不受上报节流影响
         listener?.onLivePlayback(playback)
     }
 
@@ -511,11 +616,82 @@ object HostSession {
         pusher = HostStatePusher(
             scope = scope,
             tokenProvider = { appContext?.let { SessionManager(it).getToken() } },
-            onOutcome = { onPushOutcome(it) }
+            onOutcome = { onPushOutcome(it) },
+            // 顺带上报播放器的成员 token，服务端要靠它探测房间是否还在
+            neriTokenProvider = { watcher?.memberToken }
         )
 
         startKeepalive(scope)
+        startNeriWatchdog(scope)
         startForegroundService()
+    }
+
+    /**
+     * Neri 静默看门狗。
+     *
+     * 「连接活着但不再推送」这种故障没有任何回调可以依赖 ——
+     * TCP 还连着、ping 还通，onFailure/onClosed 都不触发，
+     * 于是歌卡在某一首再也不动，而所有指标看起来都正常。
+     * 只能靠「多久没收到消息」主动发现，然后强制重连。
+     * 重连会走一次 join，而 join 的响应里带着当前播放状态，正好把卡住的歌补回来。
+     */
+    private fun startNeriWatchdog(scope: CoroutineScope) {
+        if (neriWatchdogJob?.isActive == true) return
+        lastNeriEventAtMs = System.currentTimeMillis()
+
+        neriWatchdogJob = scope.launch {
+            while (isActive && hosting) {
+                delay(NERI_WATCHDOG_INTERVAL_MS)
+                if (!hosting) continue
+
+                val connected = watcher?.isTransportConnected == true
+
+                // 没有连接时我们**一个数据来源都没有**：WebSocket 没建起来（join 可能正被
+                // CDN 挡着，而且退避后要等很久），这时只读接口就是唯一的救命绳，得勤快点。
+                // 有连接时它只是防"假死"的兜底，不必频繁打扰。
+                val threshold = if (connected) NERI_SILENCE_TIMEOUT_MS else NERI_POLL_ONLY_INTERVAL_MS
+
+                val silentFor = System.currentTimeMillis() - lastNeriEventAtMs
+                if (silentFor <= threshold) continue
+
+                // 重新起算，别让下一轮立刻又触发一次
+                lastNeriEventAtMs = System.currentTimeMillis()
+
+                val info = room ?: continue
+                val serverUrl = info.serverUrl ?: ApiConfig.DEFAULT_NERI_SERVER
+                val roomId = info.roomId.orEmpty()
+
+                // 无论有没有连接，都先用只读接口捞一次。
+                // 它不碰 join，不会被 CDN 当成爬虫 —— 后端每 20 秒就在轮询同一个接口。
+                // 这一条保证的是：**即使 join 被永久挡住，歌也还能继续更新**，
+                // 而不是像以前那样"一次 403 就彻底死了"。
+                val recovered = withContext(Dispatchers.IO) {
+                    watcher?.pollState(serverUrl, roomId) == true
+                }
+
+                if (recovered) {
+                    Log.i(TAG, "Neri 静默 ${silentFor / 1000}s，已通过只读接口补回状态")
+                    pollFailures = 0
+                    continue
+                }
+
+                pollFailures++
+                Log.w(TAG, "只读接口补状态失败（连续 $pollFailures 次，连接=$connected）")
+                if (pollFailures < MAX_POLL_FAILURES) continue
+
+                // 只读接口也不通了，才去碰 join（那才是会被 CDN 挡的那个，退避会兜住）
+                pollFailures = 0
+                Log.w(TAG, "只读接口连续失败，退回重连 Neri")
+                restartWatcher()
+            }
+        }
+    }
+
+    /** 掐掉当前 Neri 连接重新 join：join 的响应里带着最新播放状态，能把卡住的歌补回来 */
+    private fun restartWatcher() {
+        val info = room ?: return
+        watcher?.stopWatching()
+        startWatcher(info)
     }
 
     private fun startKeepalive(scope: CoroutineScope) {

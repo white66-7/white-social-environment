@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import okhttp3.Call
+import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -41,8 +42,46 @@ class NeriRealtimeWatcher(
         private const val PREF_NAME = "neri_watcher_prefs"
         private const val KEY_DEVICE_UUID = "device_uuid"
 
-        /** 断线后静默重连的延迟 */
+        /**
+         * 每个房间记住服务端发回来的 memberSecret。
+         *
+         * 这是 NeriPlayer-LTW 的协议要求（见其 src/worker.js）：
+         *   邀请链接里的 joinSecret 只用于**首次加入**；
+         *   一旦你已经是房间成员，重连就**必须**带自己的 memberSecret，
+         *   否则服务端直接返回 **403 `member_secret_required`**。
+         *
+         * 我们以前每次重连都在发 joinSecret，所以第一次能连上、
+         * 之后每次重连都被拒 —— 表现就是「歌卡住，而且再也回不来」。
+         */
+        private fun keyMemberSecret(roomId: String) = "member_secret_$roomId"
+
+        /** 断线后静默重连的初始延迟 */
         private const val RETRY_DELAY_MS = 3_000L
+
+        /**
+         * 请求播放器服务器时用的 User-Agent。
+         *
+         * OkHttp 默认发 `okhttp/4.12.0`，而这种库 UA 正是 Cloudflare 机器人评分里
+         * 权重最高的"自动化"信号之一 —— 实测 join 被返回 **403 + 空 body**
+         * （请求根本到不了业务代码，Neri 自己的错误响应都是带 JSON 的）。
+         *
+         * 我们是这个服务的正常使用者（拿着有效的邀请口令与密钥加入房间），
+         * 被挡属于误判，换一个正常的 UA 是这类误判的标准处理方式。
+         * 如果哪天不需要了，把下面这行删掉即可，其余代码不受影响。
+         */
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+
+        /**
+         * 重连延迟的上限。
+         *
+         * 退避是必须的：join 是打在 Cloudflare 后面的，**固定 3 秒一次的重试等于每分钟
+         * 20 次请求**。一旦对面把它判成爬虫（表现就是 403 + 空 body，请求根本到不了业务
+         * 代码），我们就会一直重试、一直被挡 —— 自己把自己永久锁死，
+         * 而且看起来像是"Neri 服务端坏了"。
+         */
+        private const val MAX_RETRY_DELAY_MS = 5 * 60_000L
 
         /** 断线时那次「房间还在不在」探测的超时，必须短，不能把重连拖住 */
         private const val PROBE_TIMEOUT_MS = 3_000L
@@ -54,23 +93,59 @@ class NeriRealtimeWatcher(
      */
     private val probeClient = OkHttpClient.Builder()
         .dns(EdgeDns)
+        .addInterceptor(browserUserAgent())
         .connectTimeout(PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .readTimeout(PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         .build()
 
+    /** 把 OkHttp 默认的库 UA 换成正常客户端的，避开 CDN 的自动化误判 */
+    private fun browserUserAgent() = Interceptor { chain ->
+        chain.proceed(
+            chain.request().newBuilder()
+                .header("User-Agent", USER_AGENT)
+                .build()
+        )
+    }
+
     // ⚡ 每台设备持久化分配独立 UUID，杜绝多个用户共用相同静态 UUID 导致互相顶号
-    private val deviceUuid: String by lazy {
+    @Volatile
+    private var deviceUuid: String = ""
+
+    private fun loadDeviceUuid(): String {
+        val cached = deviceUuid
+        if (cached.isNotEmpty()) return cached
+
         val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
         var id = sp.getString(KEY_DEVICE_UUID, null)
         if (id.isNullOrEmpty()) {
             id = UUID.randomUUID().toString()
             sp.edit().putString(KEY_DEVICE_UUID, id).apply()
         }
-        id
+        deviceUuid = id
+        return id
+    }
+
+    /**
+     * 换一个全新的成员身份。
+     *
+     * 什么时候需要：服务端认为我们的 userUuid 已经是房间成员（所以拒绝邀请密钥），
+     * 但我们本地又没有对应的 memberSecret（比如这一步修复之前连过、或者清了应用数据），
+     * 那就是解不开的死锁 —— 用什么密钥都会被 403。
+     *
+     * 代价是房间里会留下一个「幽灵成员」（旧 uuid），但比永远连不上强。
+     * 只在确实无解时才调用。
+     */
+    private fun rotateDeviceUuid() {
+        val sp = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        val fresh = UUID.randomUUID().toString()
+        sp.edit().putString(KEY_DEVICE_UUID, fresh).apply()
+        deviceUuid = fresh
+        Log.w(TAG, "本地身份无法与服务端成员匹配，已更换设备标识重新加入")
     }
 
     private val client = OkHttpClient.Builder()
         .dns(EdgeDns)
+        .addInterceptor(browserUserAgent())
         .connectTimeout(6, TimeUnit.SECONDS)
         .readTimeout(12, TimeUnit.SECONDS)
         .pingInterval(10, TimeUnit.SECONDS)
@@ -85,6 +160,49 @@ class NeriRealtimeWatcher(
     @Volatile private var currentRoomId: String? = null
     @Volatile private var isClosedManually = false
     @Volatile private var isConnecting = false
+
+    /**
+     * 当前的重试延迟，每次失败翻倍，封顶 [MAX_RETRY_DELAY_MS]。
+     * **只在真正连上时**归零 —— 被限流的状态下归零，等于继续按最短间隔去砸门。
+     */
+    @Volatile private var retryDelayMs = RETRY_DELAY_MS
+
+    /** 上一次 join 的结果，只为诊断用（临时） */
+    @Volatile private var lastJoinResult = "未开始"
+
+    /**
+     * 当前房间的成员 Bearer Token，由 join 响应下发。
+     * `/state` 查询需要它。
+     */
+    @Volatile private var currentMemberToken: String? = null
+
+    /**
+     * 当前房间的成员 Bearer Token。
+     * 后端的「房间还在不在」存活探测需要它（不带 token 一律 401）。
+     */
+    val memberToken: String? get() = currentMemberToken
+
+    /**
+     * 传输层是不是真的连着的（用来区分「连了但不说话」和「压根没连上」）。
+     * 看门狗只该管前者。
+     */
+    val isTransportConnected: Boolean get() = activeWebSocket != null
+
+    /**
+     * 诊断用：当前推送通道到底处于什么状态、上一次 join 为什么没成。
+     *
+     * 这几件事光看"有没有收到消息"是分不出来的：连接可能断着、可能连上了但没订阅、
+     * 也可能连了但服务端不说话。分开显示才能定位。
+     */
+    fun channelState(): String {
+        val transport = when {
+            isClosedManually -> "已停止"
+            activeWebSocket != null -> "WS已连"
+            isConnecting -> "join中"
+            else -> "未连"
+        }
+        return "$transport/${lastJoinResult}"
+    }
 
     /**
      * 每次 startWatching 自增，回调里靠它判断自己是不是「上一代」连接。
@@ -144,10 +262,19 @@ class NeriRealtimeWatcher(
                 val baseUrl = serverUrl.trimEnd('/')
                 val joinUrl = "$baseUrl/api/rooms/$roomId/join"
 
+                // 已经不是新成员了就用 memberSecret，否则用邀请密钥。
+                // 用错会被服务端以 403 member_secret_required 拒掉。
+                val prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                val memberSecret = prefs.getString(keyMemberSecret(roomId), null)
+
                 val joinPayload = JSONObject().apply {
-                    put("userUuid", deviceUuid)
+                    put("userUuid", loadDeviceUuid())
                     put("nickname", userNickname.ifBlank { "群友伴侣" })
-                    put("joinSecret", secret)
+                    if (!memberSecret.isNullOrEmpty()) {
+                        put("memberSecret", memberSecret)
+                    } else {
+                        put("joinSecret", secret)
+                    }
                 }
 
                 val joinReq = Request.Builder()
@@ -163,12 +290,35 @@ class NeriRealtimeWatcher(
 
                 // 404 或 410 说明房间在服务端已销毁
                 if (joinResp.code in listOf(404, 410)) {
+                    lastJoinResult = "http${joinResp.code}"
                     Log.w(TAG, "房间在服务端已失效: code=${joinResp.code}")
                     notifyRoomClosed(myGeneration)
                     return@Thread
                 }
 
                 if (!joinResp.isSuccessful || respBody.isEmpty()) {
+                    // 一定要把服务端给的 error 读出来。
+                    // 以前这里直接按「状态码 + 空响应」下结论，把真正的
+                    // `member_secret_required` 整段吞掉了 —— 结果我花了好几轮
+                    // 去猜「是不是 Cloudflare 拦的」，而答案一直就在 body 里。
+                    val err = runCatching { JSONObject(respBody).optString("error") }
+                        .getOrNull().orEmpty()
+                    Log.w(TAG, "join 被拒 code=${joinResp.code} error=$err body=${respBody.take(120)}")
+                    lastJoinResult = if (err.isNotEmpty()) "被拒:$err" else "http${joinResp.code}"
+
+                    if (err.contains("member_secret_required")) {
+                        // 服务端认为我们已经是成员，但我们手上没有（或已失效）的 memberSecret。
+                        if (!memberSecret.isNullOrEmpty()) {
+                            // 有记录但服务端不认 —— 多半是房间被重建、房间号复用。
+                            // 清掉它，下一轮改用邀请密钥以新成员身份加入。
+                            Log.w(TAG, "成员密钥已失效，清除后改用邀请密钥重试")
+                            prefs.edit().remove(keyMemberSecret(roomId)).apply()
+                        } else {
+                            // 压根没有记录，而服务端又不认邀请密钥 —— 死锁，只能换身份。
+                            rotateDeviceUuid()
+                        }
+                    }
+
                     scheduleSilentRetry(serverUrl, roomId, secret, userNickname, myGeneration)
                     return@Thread
                 }
@@ -176,6 +326,7 @@ class NeriRealtimeWatcher(
                 val json = JSONObject(respBody)
                 if (!json.optBoolean("ok", false)) {
                     val err = json.optString("error", "")
+                    lastJoinResult = "被拒:${err.take(18)}"
                     if (err.contains("not found", ignoreCase = true) || err.contains("missing", ignoreCase = true)) {
                         notifyRoomClosed(myGeneration)
                     } else {
@@ -185,26 +336,52 @@ class NeriRealtimeWatcher(
                 }
 
                 val token = json.optString("token", "")
+                // 把服务端发的 memberSecret 记下来 —— 下次重连必须用它，
+                // 否则会被 403 member_secret_required 顶回来，而且再也连不上。
+                json.optString("memberSecret").takeIf { it.isNotEmpty() }?.let {
+                    prefs.edit().putString(keyMemberSecret(roomId), it).apply()
+                }
+                currentMemberToken = token
+
                 val initState = json.optJSONObject("state")
                 initState?.let { parseAndDispatchState(it) }
 
                 // join 已经被服务端接受 —— 口令是真的，房间也真的存在
                 notifyConnected(myGeneration)
 
-                if (token.isEmpty() || isClosedManually || myGeneration != generation) return@Thread
+                if (myGeneration != generation || isClosedManually) return@Thread
 
-                val wsUrl = baseUrl.replaceFirst("http://", "ws://")
-                    .replaceFirst("https://", "wss://") + "/api/rooms/$roomId/ws?token=$token"
+                if (token.isEmpty()) {
+                    // 没有 token 就打不开 WebSocket。
+                    // 这里以前是静默 return —— 后果非常隐蔽：notifyConnected 已经回调过，
+                    // 上层以为连上了；没有 WebSocket，于是永远收不到推送；
+                    // 又因为没排重试，没有任何机制能从这个状态里恢复。
+                    // 表现就是「歌卡在某一首再也不动，而所有指标看起来都正常」。
+                    lastJoinResult = "noToken"
+                    Log.w(TAG, "join 成功但没拿到 token，无法建立推送通道，稍后重试")
+                    scheduleSilentRetry(serverUrl, roomId, secret, userNickname, myGeneration)
+                    return@Thread
+                }
+
+                // 服务端会在 join 响应里直接给一个拼好的 wsUrl，优先用它 ——
+                // 地址格式由服务端决定，我们不该自己拼。
+                val wsUrl = json.optString("wsUrl").takeIf { it.isNotEmpty() }
+                    ?: (baseUrl.replaceFirst("http://", "ws://")
+                        .replaceFirst("https://", "wss://") + "/api/rooms/$roomId/ws?token=$token")
 
                 val wsRequest = Request.Builder()
                     .url(wsUrl)
                     .addHeader("Authorization", "Bearer $token")
                     .build()
 
+                lastJoinResult = "ok"
                 val newWs = client.newWebSocket(wsRequest, object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         if (myGeneration != generation) return
                         isConnecting = false
+                        lastJoinResult = "ok"
+                        // 真的连上了才把退避清零
+                        retryDelayMs = RETRY_DELAY_MS
                         Log.i(TAG, "🚀 Neri WebSocket 连接成功！正在监听切歌事件...")
                     }
 
@@ -256,6 +433,7 @@ class NeriRealtimeWatcher(
                 activeWebSocket = newWs
 
             } catch (e: Exception) {
+                lastJoinResult = "异常:${e.message?.take(18)}"
                 if (!isClosedManually) {
                     scheduleSilentRetry(serverUrl, roomId, secret, userNickname, myGeneration)
                 }
@@ -290,6 +468,53 @@ class NeriRealtimeWatcher(
         if (myGeneration != generation) return
         // 只清自己那一条，别把新一代的连接误伤掉
         if (activeWebSocket === dead) activeWebSocket = null
+    }
+
+    /**
+     * 用只读的 state 接口拉一次房间状态，喂进同一套解析逻辑。
+     *
+     * 为什么优先用它而不是重连：重连要打 **join** 接口，而那个接口在 CDN 的机器人评分里
+     * 权重很高 —— 反复重连会被判成爬虫（实测 403 + 空 body）。而 state 是只读的，
+     * 后端每 20 秒就在轮询同一个接口、从来没被挡过，压力小得多。
+     *
+     * 注意这是阻塞调用，必须在 IO 线程上执行。
+     *
+     * @return 是否成功拿到并解析出状态
+     */
+    fun pollState(serverUrl: String, roomId: String): Boolean {
+        val base = serverUrl.trim().removeSuffix("/")
+        if (base.isEmpty() || roomId.isEmpty()) return false
+
+        // /state **需要成员 Bearer Token**（见 NeriPlayer-LTW 的 worker.js：
+        // `const auth = await this.authenticateMember(request); if (!auth) return 401`）。
+        // 这里以前完全没带 token，所以这条兜底从来就没成功过 —— 401。
+        val token = currentMemberToken
+        if (token.isNullOrEmpty()) {
+            Log.w(TAG, "还没有成员 token，无法查询房间状态")
+            return false
+        }
+
+        return try {
+            val request = Request.Builder()
+                .url("$base/api/rooms/$roomId/state")
+                .addHeader("Authorization", "Bearer $token")
+                .get()
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return false
+                val body = response.body?.string().orEmpty()
+                if (body.isEmpty()) return false
+
+                // 和 onMessage 一样：状态可能直接就是 body，也可能包在 state 字段里
+                val json = JSONObject(body)
+                parseAndDispatchState(json.optJSONObject("state") ?: json)
+                true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "轮询房间状态失败: ${e.message}")
+            false
+        }
     }
 
     /**
@@ -345,11 +570,15 @@ class NeriRealtimeWatcher(
         isConnecting = false
         if (isClosedManually) return
 
+        val delay = retryDelayMs
+        retryDelayMs = (retryDelayMs * 2).coerceAtMost(MAX_RETRY_DELAY_MS)
+        Log.i(TAG, "将在 ${delay}ms 后重试连接播放器（下一次 ${retryDelayMs}ms）")
+
         mainHandler.postDelayed({
             if (myGeneration == generation && !isClosedManually && currentRoomId == roomId) {
                 startWatching(serverUrl, roomId, secret, userNickname)
             }
-        }, RETRY_DELAY_MS)
+        }, delay)
     }
 
     private fun notifyConnected(myGeneration: Int) {

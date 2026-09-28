@@ -30,10 +30,34 @@ import okhttp3.Call
  *
  * 线程约定：公开方法都在主线程调用；[onOutcome] 也回到主线程派发。
  */
+/**
+ * 上报统计。
+ *
+ * 临时调试用：排查「切歌跟不上」时，光看界面是看不出上报到底有没有送出去的。
+ * 查完可以把 [PushStats]、[HostStatePusher.stats] 和界面那一行一起删掉。
+ */
+data class PushStats(
+    /** 真正发出去的上报次数（不含被合并掉的） */
+    val total: Long,
+    val ok: Long,
+    /** 因切歌抢发而被主动取消的次数 */
+    val preempted: Long,
+    /** 服务端判定迟到/重复而丢弃的次数 */
+    val stale: Long,
+    /** 其它失败（超时、断网等） */
+    val failed: Long,
+    /** 最近一次成功往返耗时 */
+    val lastRoundTripMs: Long,
+    /** 上次成功上报的时刻，0 = 还没成功过 */
+    val lastOkAtMs: Long
+)
+
 class HostStatePusher(
     private val scope: CoroutineScope,
     private val tokenProvider: () -> String?,
     private val onOutcome: (PushOutcome) -> Unit,
+    /** 播放器那边的成员 Bearer Token，后端存活探测要用它 */
+    private val neriTokenProvider: () -> String? = { null },
     private val api: RoomApiService = RoomApiService()
 ) {
 
@@ -41,7 +65,12 @@ class HostStatePusher(
         private const val TAG = "HostPusher"
     }
 
-    private data class Request(val playback: PlaybackPayload?, val confirm: Boolean)
+    private data class Request(
+        val playback: PlaybackPayload?,
+        val confirm: Boolean,
+        /** 只为日志可读性保留 */
+        val seq: Long
+    )
 
     /** 容量 1 + CONFLATED：新请求直接覆盖还没被取走的旧请求 */
     private val queue = Channel<Request>(Channel.CONFLATED)
@@ -72,6 +101,32 @@ class HostStatePusher(
      */
     @Volatile
     private var inFlight: Call? = null
+
+    // ---------- 统计（临时调试用，可以整块删掉）----------
+    private var statTotal = 0L
+    private var statOk = 0L
+    private var statPreempted = 0L
+    private var statStale = 0L
+    private var statFailed = 0L
+    private var statLastRoundTripMs = 0L
+    private var statLastOkAtMs = 0L
+
+    /** 在途那一条的 seq，用来判断某个 Failed 是不是"被自己抢发掐掉的" */
+    @Volatile
+    private var inFlightSeq = -1L
+
+    /** 刚被抢发取消掉的那条 seq */
+    private var preemptedSeq = -1L
+
+    fun stats(): PushStats = PushStats(
+        total = statTotal,
+        ok = statOk,
+        preempted = statPreempted,
+        stale = statStale,
+        failed = statFailed,
+        lastRoundTripMs = statLastRoundTripMs,
+        lastOkAtMs = statLastOkAtMs
+    )
 
     fun stop() {
         inFlight?.cancel()
@@ -105,12 +160,20 @@ class HostStatePusher(
             Request(
                 playback = playback?.copy(seq = next),
                 // 只要还没被确认过，每条请求都捎上它
-                confirm = confirmOutstanding
+                confirm = confirmOutstanding,
+                seq = next
             )
         )
 
-        // 切歌：把已经过时的那次位置上报掐掉，别让新歌排在它后面等一个来回
-        if (urgent) staleCall?.cancel()
+        // 切歌：把已经过时的那次位置上报掐掉，别让新歌排在它后面等一个来回。
+        // 连接是 HTTP/2（实测两个域名都协商到 h2），取消只发一个 RST_STREAM，
+        // 不会把连接废掉，所以这一步是廉价的。
+        if (urgent && staleCall != null) {
+            Log.d(TAG, "seq=$next 抢发，取消在途的旧上报")
+            statPreempted++
+            preemptedSeq = inFlightSeq
+            staleCall.cancel()
+        }
 
         ensureWorker()
     }
@@ -128,19 +191,41 @@ class HostStatePusher(
                     continue
                 }
 
+                val startedAt = System.currentTimeMillis()
+                statTotal++
                 val outcome = withContext(Dispatchers.IO) {
                     api.hostPushState(
                         token = token,
                         playback = req.playback,
                         confirm = req.confirm,
-                        onCall = { inFlight = it }
+                        neriToken = neriTokenProvider(),
+                        onCall = { call ->
+                            inFlight = call
+                            inFlightSeq = req.seq
+                        }
                     )
                 }
+                val elapsed = System.currentTimeMillis() - startedAt
                 inFlight = null
+                inFlightSeq = -1L
 
                 // 只有服务端明确受理才算确认送达。
                 // Stale 代表它把这条整个丢掉了（包括捎带的 confirm），所以不能清。
-                if (outcome is PushOutcome.Ok) confirmOutstanding = false
+                if (outcome is PushOutcome.Ok) {
+                    confirmOutstanding = false
+                    statOk++
+                    statLastRoundTripMs = elapsed
+                    statLastOkAtMs = System.currentTimeMillis()
+                } else if (outcome is PushOutcome.Stale) {
+                    statStale++
+                } else if (outcome is PushOutcome.Failed) {
+                    // 被自己抢发掐掉的那条已经算进 preempted 了，别重复计成失败
+                    if (req.seq != preemptedSeq) statFailed++
+                }
+
+                // 排查「切歌跟不上」用：能看到这条到底是送达了、被服务端判迟到、
+                // 还是因为抢发被自己取消掉了
+                Log.d(TAG, "seq=${req.seq} 上报结果=$outcome 耗时=${elapsed}ms")
 
                 onOutcome(outcome)
             }

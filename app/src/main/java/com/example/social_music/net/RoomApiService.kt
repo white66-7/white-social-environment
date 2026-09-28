@@ -274,10 +274,13 @@ class RoomApiService {
         token: String,
         playback: PlaybackPayload?,
         confirm: Boolean = false,
+        neriToken: String? = null,
         onCall: ((Call) -> Unit)? = null
     ): PushOutcome =
         withContext(Dispatchers.IO) {
             val payload = JSONObject()
+            // 播放器那边的成员 token，服务端存活探测要用（不带 token 一律 401）
+            if (!neriToken.isNullOrEmpty()) payload.put("neriToken", neriToken)
             if (playback != null) {
                 payload.put("playback", JSONObject().apply {
                     put("currentSong", playback.currentSong ?: JSONObject.NULL)
